@@ -1,35 +1,19 @@
-# 本次代码修改说明
+# 当前版本修改说明
 
-本次改动的核心目标是：
+本版本已经**彻底移除 TSFI-Fusion 的方法性模块**，只保留工程外壳：
 
-1. 删除 TSFI-Fusion 的两阶段训练策略；
-2. 改为单阶段端到端训练；
-3. 保留当前工程中可复用的编码器 / 基础分支 / 解码器外壳；
-4. 将真正的细节融合主路径替换为我们的高层先验引导频率 token 融合模块。
+- 删除 TSFI 的原始编码器/解码器实现
+- 删除 CATM / BSC / DDE / CIIM / DDIM / INN / FDCM 等方法性模块
+- 改为干净版本：
+  - `net/encoder/simple_encoder.py`
+  - `net/fusion/base_fusion.py`
+  - `net/decoder/simple_decoder.py`
+- 保留你自己的核心创新：
+  - `net/frequency_fusion/` 中的高层先验引导频率 token 融合模块
 
-## 当前训练策略
+当前主干：
+红外/可见光 -> 共享编码器 -> 基础融合分支 + 高频频率融合分支 -> 解码器 -> 融合图像
 
-当前 `train.py` 已经改为 **单阶段训练**：
-
-- 第 1 个 epoch 起就联合训练：
-  - `Restormer_Encoder`
-  - `BaseFeatureExtraction`
-  - `HighLevelGuidedFrequencyFusion`
-  - `Restormer_Decoder`
-- 不再存在 Phase I / Phase II 的拆分
-- 不再进行“先自编码重建，再做融合”的训练流程
-
-## 当前损失
-
-当前版本采用：
-
-- `Fusionloss`：亮度 / 显著性 + 梯度约束
-- `loss_decomp`：基础特征相关、细节特征解相关
-
-这是一个先求稳、先跑通结构的版本。
-
-## 当前推理
-
-`test.py` 默认加载的新权重文件为：
-
-- `models/HighLevelGuidedFreqFusion_SingleStage_latest.pth`
+当前训练方式：
+- 单阶段端到端训练
+- 不再使用 TSFI-Fusion 的两阶段训练策略
