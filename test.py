@@ -13,11 +13,11 @@ warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.CRITICAL)
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-ckpt_path = r'./models/HighLevelGuidedFreqFusion_latest.pth'
+ckpt_path = r'./models/HighLevelGuidedFreqFusion_SingleStage_latest.pth'
 # for dataset_name in ["TNO","MSRS","M3FD"]:
 for dataset_name in ["TNO"]:
     print("\n" * 2 + "=" * 80)
-    model_name = "TSFI-Fusion    "
+    model_name = "Ours-Frequency    "
     print("The test result of " + dataset_name + ' :')
 
     path = './test_img/'
