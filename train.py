@@ -17,10 +17,41 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 
 def build_model(device: str):
-    encoder = nn.DataParallel(SharedEncoder(inp_channels=1, feature_dim=64)).to(device)
-    decoder = nn.DataParallel(FusionDecoder(channels=64, out_channels=1)).to(device)
+    encoder = nn.DataParallel(
+        SharedEncoder(
+            inp_channels=1,
+            feature_dim=64,
+            inner_dim=24,
+            num_blocks=1,
+            num_heads=1,
+            ffn_expansion_factor=2.0
+        )
+    ).to(device)
+
+    decoder = nn.DataParallel(
+        FusionDecoder(
+            channels=64,
+            out_channels=1,
+            inner_dim=24,
+            num_blocks=1,
+            num_heads=1,
+            ffn_expansion_factor=2.0
+        )
+    ).to(device)
+
     base_fusion = nn.DataParallel(BaseFusion(channels=64)).to(device)
-    freq_fusion = nn.DataParallel(HighLevelGuidedFrequencyFusion(in_channels=64, patch_size=4, amp_topk_ratio=0.25, phase_topk_ratio=0.25, token_embed_dim=128, num_heads=4)).to(device)
+
+    freq_fusion = nn.DataParallel(
+        HighLevelGuidedFrequencyFusion(
+            in_channels=64,
+            patch_size=4,
+            amp_topk_ratio=0.25,
+            phase_topk_ratio=0.25,
+            token_embed_dim=128,
+            num_heads=4
+        )
+    ).to(device)
+
     return encoder, decoder, base_fusion, freq_fusion
 
 
@@ -40,7 +71,7 @@ criteria_fusion = Fusionloss().to(device)
 criteria_ssim = SimpleSSIMLoss(window_size=11).to(device)
 criteria_freq = FrequencyConsistencyLoss(low_weight=1.0, high_weight=1.0).to(device)
 
-num_epochs = 120
+num_epochs = 5
 lr = 1e-4
 weight_decay = 0.0
 batch_size = 8

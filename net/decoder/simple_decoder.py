@@ -1,35 +1,52 @@
 # -*- coding: utf-8 -*-
-"""干净版本的解码器。"""
 import torch
 import torch.nn as nn
-from .blocks import DecodeBlock
+from net.restormer_light import TransformerBlock
 
 
 class SimpleDecoder(nn.Module):
-    def __init__(self, channels: int = 64, out_channels: int = 1):
+    """
+    轻量单尺度 Restormer 解码器
+    对外接口保持不变：
+        forward(inp_img, base_feature, freq_feature, fuse=None)
+    """
+    def __init__(
+        self,
+        channels=64,
+        out_channels=1,
+        inner_dim=24,
+        num_blocks=1,
+        num_heads=1,
+        ffn_expansion_factor=2.0,
+        bias=False,
+        LayerNorm_type='WithBias'
+    ):
         super().__init__()
-        self.fuse = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 3, 1, 1),
-            nn.ReLU(inplace=True),
-        )
-        self.body = nn.Sequential(
-            DecodeBlock(channels),
-            DecodeBlock(channels),
-            DecodeBlock(channels),
-        )
-        self.skip_proj = nn.Conv2d(channels, 32, 1, 1, 0)
-        self.img_proj = nn.Conv2d(out_channels, 32, 3, 1, 1)
+
+        self.reduce = nn.Conv2d(channels * 2, inner_dim, kernel_size=1, bias=bias)
+
+        self.decoder_body = nn.Sequential(*[
+            TransformerBlock(
+                dim=inner_dim,
+                num_heads=num_heads,
+                ffn_expansion_factor=ffn_expansion_factor,
+                bias=bias,
+                LayerNorm_type=LayerNorm_type
+            ) for _ in range(num_blocks)
+        ])
+
         self.head = nn.Sequential(
-            nn.Conv2d(channels, 32, 3, 1, 1),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(inner_dim, inner_dim, 3, 1, 1, bias=bias),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(inner_dim, out_channels, 3, 1, 1, bias=bias)
         )
-        self.out = nn.Conv2d(32, out_channels, 3, 1, 1)
 
     def forward(self, inp_img: torch.Tensor, base_feature: torch.Tensor, freq_feature: torch.Tensor, fuse: str = None):
         x = torch.cat([base_feature, freq_feature], dim=1)
-        x = self.fuse(x)
-        body_feat = self.body(x)
-        recon_feat = self.head(body_feat)
-        recon_feat = recon_feat + self.skip_proj(base_feature) + self.img_proj(inp_img)
-        out = torch.sigmoid(self.out(recon_feat))
-        return out, body_feat
+        x = self.reduce(x)
+        body_feat = self.decoder_body(x)
+
+        out = self.head(body_feat)
+        out = out + inp_img
+
+        return torch.sigmoid(out), body_feat

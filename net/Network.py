@@ -6,6 +6,7 @@ from net.decoder.simple_decoder import SimpleDecoder
 
 
 class SharedEncoder(SimpleSharedEncoder):
+    """当前项目使用的共享编码器（Restormer 轻量版）。"""
     pass
 
 
@@ -14,6 +15,7 @@ class BaseFusion(SimpleBaseFusion):
 
 
 class FusionDecoder(SimpleDecoder):
+    """当前项目使用的解码器（Restormer 轻量版）。"""
     pass
 
 
