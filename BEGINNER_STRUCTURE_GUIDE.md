@@ -1,19 +1,19 @@
-# 给初学者看的当前网络结构
+# 当前主干结构速览
 
-当前网络只有 4 个核心模块：
+当前工程已经切换到干净重写版主干：
 
-1. `Restormer_Encoder`
-   - 现在实际是 `SimpleSharedEncoder`
-   - 提取 `base_feat` 和 `freq_feat`
+1. `SharedEncoder`
+   - 文件：`net/encoder/simple_encoder.py`
+   - 功能：提取共享特征，并拆出 base / freq 两路特征。
 
-2. `BaseFeatureExtraction`
-   - 现在实际是 `SimpleBaseFusion`
-   - 融合基础共享信息
+2. `BaseFusion`
+   - 文件：`net/fusion/base_fusion.py`
+   - 功能：融合低频共享信息，保持结构稳定。
 
 3. `HighLevelGuidedFrequencyFusion`
-   - 这是你的核心创新模块
-   - 做 FFT、幅度相位分解、token 选择与交互
+   - 文件：`net/frequency_fusion/fusion_block.py`
+   - 功能：FFT -> 相位/幅度 token 化 -> intent 条件评分 -> Top-K 选择 -> selective interaction -> 轻量保留路径 -> 频谱重组 -> iFFT。
 
-4. `Restormer_Decoder`
-   - 现在实际是 `SimpleDecoder`
-   - 把两路融合特征重建成最终图像
+4. `FusionDecoder`
+   - 文件：`net/decoder/simple_decoder.py`
+   - 功能：接收 `[F_base, F_freq]` 两路特征，重建融合图像。

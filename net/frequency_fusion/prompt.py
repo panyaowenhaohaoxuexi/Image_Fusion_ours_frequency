@@ -2,26 +2,39 @@
 import torch
 import torch.nn as nn
 
+
 class FixedPromptBank(nn.Module):
-    """固定的高层先验库。当前阶段不接真实 CLIP。"""
+    """固定高层先验库。当前阶段不接真实 CLIP。"""
+
     def __init__(self, prior_dim: int = 64):
         super().__init__()
-        self.prompt_names = ['salient_targets','structural_contours','fine_textures','balanced_fusion']
+        self.prompt_names = [
+            'salient_targets',
+            'structural_contours',
+            'fine_textures',
+            'balanced_fusion',
+        ]
         bank = torch.zeros(len(self.prompt_names), prior_dim, dtype=torch.float32)
         for i in range(len(self.prompt_names)):
             bank[i, i::len(self.prompt_names)] = 1.0
         bank = bank / (bank.norm(dim=1, keepdim=True) + 1e-6)
         self.register_buffer('prompt_bank', bank)
+
     def forward(self) -> torch.Tensor:
         return self.prompt_bank
 
+
 class IntentRouter(nn.Module):
-    """根据输入特征预测当前更偏向哪一种融合意图。"""
     def __init__(self, in_channels: int, prior_dim: int, num_prompts: int = 4):
         super().__init__()
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.mlp = nn.Sequential(nn.Linear(in_channels * 2, in_channels), nn.ReLU(inplace=True), nn.Linear(in_channels, num_prompts))
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels * 2, in_channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels, num_prompts),
+        )
         self.proj = nn.Linear(prior_dim, prior_dim)
+
     def forward(self, vis_feat: torch.Tensor, ir_feat: torch.Tensor, prompt_bank: torch.Tensor):
         b, c, _, _ = vis_feat.shape
         vis_vec = self.pool(vis_feat).view(b, c)

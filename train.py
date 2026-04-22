@@ -1,38 +1,61 @@
 # -*- coding: utf-8 -*-
-from net.Network import Restormer_Encoder, Restormer_Decoder, BaseFeatureExtraction
-from net.frequency_fusion import HighLevelGuidedFrequencyFusion
-from utils.dataset import H5Dataset
-import os, sys, time, datetime
+import os
+import sys
+import time
+import datetime
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from utils.loss import Fusionloss, SimpleSSIMLoss
+
+from net.Network import SharedEncoder, FusionDecoder, BaseFusion
+from net.frequency_fusion import HighLevelGuidedFrequencyFusion
+from utils.dataset import H5Dataset
+from utils.loss import Fusionloss, SimpleSSIMLoss, FrequencyConsistencyLoss
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
+
+def build_model(device: str):
+    encoder = nn.DataParallel(SharedEncoder(inp_channels=1, feature_dim=64)).to(device)
+    decoder = nn.DataParallel(FusionDecoder(channels=64, out_channels=1)).to(device)
+    base_fusion = nn.DataParallel(BaseFusion(channels=64)).to(device)
+    freq_fusion = nn.DataParallel(HighLevelGuidedFrequencyFusion(in_channels=64, patch_size=4, amp_topk_ratio=0.25, phase_topk_ratio=0.25, token_embed_dim=128, num_heads=4)).to(device)
+    return encoder, decoder, base_fusion, freq_fusion
+
+
+def save_checkpoint(path: str, encoder, decoder, base_fusion, freq_fusion):
+    checkpoint = {
+        'shared_encoder': encoder.state_dict(),
+        'fusion_decoder': decoder.state_dict(),
+        'base_fusion': base_fusion.state_dict(),
+        'frequency_fusion': freq_fusion.state_dict(),
+    }
+    torch.save(checkpoint, path)
+
+
 criteria_fusion = Fusionloss()
 criteria_ssim = SimpleSSIMLoss(window_size=11)
+criteria_freq = FrequencyConsistencyLoss(low_weight=1.0, high_weight=1.0)
 
 num_epochs = 120
 lr = 1e-4
-weight_decay = 0
+weight_decay = 0.0
 batch_size = 8
 coeff_fusion = 1.0
 coeff_ssim = 2.0
+coeff_freq = 0.5
 clip_grad_norm_value = 0.01
 optim_step = 20
 optim_gamma = 0.5
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-DIDF_Encoder = nn.DataParallel(Restormer_Encoder(inp_channels=1, feature_dim=64)).to(device)
-DIDF_Decoder = nn.DataParallel(Restormer_Decoder(channels=64, out_channels=1)).to(device)
-BaseFuseLayer = nn.DataParallel(BaseFeatureExtraction(channels=64)).to(device)
-DetailFuseLayer = nn.DataParallel(HighLevelGuidedFrequencyFusion(in_channels=64, patch_size=4, amp_topk_ratio=0.25, phase_topk_ratio=0.25, token_embed_dim=128, num_heads=4)).to(device)
+shared_encoder, fusion_decoder, base_fusion, frequency_fusion = build_model(device)
 
-optimizer1 = torch.optim.Adam(DIDF_Encoder.parameters(), lr=lr, weight_decay=weight_decay)
-optimizer2 = torch.optim.Adam(DIDF_Decoder.parameters(), lr=lr, weight_decay=weight_decay)
-optimizer3 = torch.optim.Adam(BaseFuseLayer.parameters(), lr=lr, weight_decay=weight_decay)
-optimizer4 = torch.optim.Adam(DetailFuseLayer.parameters(), lr=lr, weight_decay=weight_decay)
+optimizer1 = torch.optim.Adam(shared_encoder.parameters(), lr=lr, weight_decay=weight_decay)
+optimizer2 = torch.optim.Adam(fusion_decoder.parameters(), lr=lr, weight_decay=weight_decay)
+optimizer3 = torch.optim.Adam(base_fusion.parameters(), lr=lr, weight_decay=weight_decay)
+optimizer4 = torch.optim.Adam(frequency_fusion.parameters(), lr=lr, weight_decay=weight_decay)
 
 scheduler1 = torch.optim.lr_scheduler.StepLR(optimizer1, step_size=optim_step, gamma=optim_gamma)
 scheduler2 = torch.optim.lr_scheduler.StepLR(optimizer2, step_size=optim_step, gamma=optim_gamma)
@@ -47,30 +70,27 @@ torch.backends.cudnn.benchmark = True
 prev_time = time.time()
 
 for epoch in range(num_epochs):
-    for i, (data_VIS, data_IR) in enumerate(loader['train']):
-        data_VIS, data_IR = data_VIS.to(device), data_IR.to(device)
-        DIDF_Encoder.train(); DIDF_Decoder.train(); BaseFuseLayer.train(); DetailFuseLayer.train()
+    for i, (data_vis, data_ir) in enumerate(loader['train']):
+        data_vis, data_ir = data_vis.to(device), data_ir.to(device)
+        shared_encoder.train(); fusion_decoder.train(); base_fusion.train(); frequency_fusion.train()
         optimizer1.zero_grad(); optimizer2.zero_grad(); optimizer3.zero_grad(); optimizer4.zero_grad()
 
-        # 1) 编码
-        feature_V_B, feature_V_F, _ = DIDF_Encoder(data_VIS)
-        feature_I_B, feature_I_F, _ = DIDF_Encoder(data_IR)
-        # 2) 基础融合分支
-        feature_F_B = BaseFuseLayer(feature_V_B, feature_I_B)
-        # 3) 高频频率融合分支
-        feature_F_D = DetailFuseLayer(feature_V_F, feature_I_F)
-        # 4) 解码输出
-        data_Fuse, _ = DIDF_Decoder(data_VIS, feature_F_B, feature_F_D)
+        vis_base, vis_freq, _ = shared_encoder(data_vis)
+        ir_base, ir_freq, _ = shared_encoder(data_ir)
+        fused_base = base_fusion(vis_base, ir_base)
+        fused_freq = frequency_fusion(vis_freq, ir_freq)
+        fused_image, _ = fusion_decoder(data_vis, fused_base, fused_freq)
 
-        fusion_loss, _, _ = criteria_fusion(data_VIS, data_IR, data_Fuse)
-        ssim_loss = criteria_ssim(data_Fuse, data_VIS) + criteria_ssim(data_Fuse, data_IR)
-        loss = coeff_fusion * fusion_loss + coeff_ssim * ssim_loss
+        fusion_loss, _, _ = criteria_fusion(data_vis, data_ir, fused_image)
+        ssim_loss = criteria_ssim(fused_image, data_vis) + criteria_ssim(fused_image, data_ir)
+        freq_loss, _, _ = criteria_freq(data_vis, data_ir, fused_image)
+        loss = coeff_fusion * fusion_loss + coeff_ssim * ssim_loss + coeff_freq * freq_loss
         loss.backward()
 
-        nn.utils.clip_grad_norm_(DIDF_Encoder.parameters(), max_norm=clip_grad_norm_value, norm_type=2)
-        nn.utils.clip_grad_norm_(DIDF_Decoder.parameters(), max_norm=clip_grad_norm_value, norm_type=2)
-        nn.utils.clip_grad_norm_(BaseFuseLayer.parameters(), max_norm=clip_grad_norm_value, norm_type=2)
-        nn.utils.clip_grad_norm_(DetailFuseLayer.parameters(), max_norm=clip_grad_norm_value, norm_type=2)
+        nn.utils.clip_grad_norm_(shared_encoder.parameters(), max_norm=clip_grad_norm_value, norm_type=2)
+        nn.utils.clip_grad_norm_(fusion_decoder.parameters(), max_norm=clip_grad_norm_value, norm_type=2)
+        nn.utils.clip_grad_norm_(base_fusion.parameters(), max_norm=clip_grad_norm_value, norm_type=2)
+        nn.utils.clip_grad_norm_(frequency_fusion.parameters(), max_norm=clip_grad_norm_value, norm_type=2)
         optimizer1.step(); optimizer2.step(); optimizer3.step(); optimizer4.step()
 
         batches_done = epoch * len(loader['train']) + i
@@ -84,7 +104,6 @@ for epoch in range(num_epochs):
         if optimizer.param_groups[0]['lr'] <= 1e-6:
             optimizer.param_groups[0]['lr'] = 1e-6
 
-checkpoint = {'DIDF_Encoder': DIDF_Encoder.state_dict(), 'DIDF_Decoder': DIDF_Decoder.state_dict(), 'BaseFuseLayer': BaseFuseLayer.state_dict(), 'DetailFuseLayer': DetailFuseLayer.state_dict()}
 os.makedirs('models', exist_ok=True)
-torch.save(checkpoint, os.path.join('models', 'HighLevelGuidedFreqFusion_Clean_' + timestamp + '.pth'))
-torch.save(checkpoint, os.path.join('models', 'HighLevelGuidedFreqFusion_Clean_latest.pth'))
+save_checkpoint(os.path.join('models', 'HighLevelGuidedFreqFusion_Clean_' + timestamp + '.pth'), shared_encoder, fusion_decoder, base_fusion, frequency_fusion)
+save_checkpoint(os.path.join('models', 'HighLevelGuidedFreqFusion_Clean_latest.pth'), shared_encoder, fusion_decoder, base_fusion, frequency_fusion)
