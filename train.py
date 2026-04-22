@@ -34,9 +34,11 @@ def save_checkpoint(path: str, encoder, decoder, base_fusion, freq_fusion):
     torch.save(checkpoint, path)
 
 
-criteria_fusion = Fusionloss()
-criteria_ssim = SimpleSSIMLoss(window_size=11)
-criteria_freq = FrequencyConsistencyLoss(low_weight=1.0, high_weight=1.0)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+criteria_fusion = Fusionloss().to(device)
+criteria_ssim = SimpleSSIMLoss(window_size=11).to(device)
+criteria_freq = FrequencyConsistencyLoss(low_weight=1.0, high_weight=1.0).to(device)
 
 num_epochs = 120
 lr = 1e-4
@@ -62,7 +64,7 @@ scheduler2 = torch.optim.lr_scheduler.StepLR(optimizer2, step_size=optim_step, g
 scheduler3 = torch.optim.lr_scheduler.StepLR(optimizer3, step_size=optim_step, gamma=optim_gamma)
 scheduler4 = torch.optim.lr_scheduler.StepLR(optimizer4, step_size=optim_step, gamma=optim_gamma)
 
-trainloader = DataLoader(H5Dataset(r"data/MSRS_train_imgsize_128_stride_200.h5"), batch_size=batch_size, shuffle=True, num_workers=0)
+trainloader = DataLoader(H5Dataset(r"E:\yizuo_SCI\2_Datasets\MSRS_train_imgsize_128_stride_200.h5"), batch_size=batch_size, shuffle=True, num_workers=0)
 loader = {'train': trainloader}
 timestamp = datetime.datetime.now().strftime("%m-%d-%H-%M")
 

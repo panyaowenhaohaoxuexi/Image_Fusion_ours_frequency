@@ -44,12 +44,12 @@ def is_low_contrast(image, fraction_threshold=0.1, lower_percentile=10,
     return ratio < fraction_threshold
 
 
-data_name = "M3FD_train"
+data_name = "MSRS_train"
 img_size = 128  # patch size
 stride = 200  # patch stride
 
-IR_files = sorted(get_img_file(r"E:\code\TSFI-Fusion-main\dataset\M3FD\ir0"))
-VIS_files = sorted(get_img_file(r"E:\code\TSFI-Fusion-main\dataset\M3FD\vi"))
+IR_files = sorted(get_img_file(r"E:\yizuo_SCI\2_Datasets\MSRS-main\train\ir"))
+VIS_files = sorted(get_img_file(r"E:\yizuo_SCI\2_Datasets\MSRS-main\train\vi"))
 
 assert len(IR_files) == len(VIS_files)
 h5f = h5py.File(os.path.join('.\\data',
