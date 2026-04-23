@@ -6,11 +6,13 @@ import torch.nn.functional as F
 
 
 def to_3d(x):
+    # [B, C, H, W] -> [B, H*W, C]
     b, c, h, w = x.shape
     return x.permute(0, 2, 3, 1).contiguous().view(b, h * w, c)
 
 
 def to_4d(x, h, w):
+    # [B, H*W, C] -> [B, C, H, W]
     b, _, c = x.shape
     return x.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
 
@@ -58,6 +60,7 @@ class FeedForward(nn.Module):
     def __init__(self, dim, ffn_expansion_factor=2.0, bias=False):
         super().__init__()
         hidden_features = int(dim * ffn_expansion_factor)
+
         self.project_in = nn.Conv2d(dim, hidden_features * 2, kernel_size=1, bias=bias)
         self.dwconv = nn.Conv2d(
             hidden_features * 2,
@@ -83,6 +86,7 @@ class Attention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+
         self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=bias)
         self.qkv_dwconv = nn.Conv2d(
             dim * 3,
@@ -132,33 +136,9 @@ class TransformerBlock(nn.Module):
 
 
 class OverlapPatchEmbed(nn.Module):
-    def __init__(self, in_c=1, embed_dim=32, bias=False):
+    def __init__(self, in_c=1, embed_dim=24, bias=False):
         super().__init__()
         self.proj = nn.Conv2d(in_c, embed_dim, kernel_size=3, stride=1, padding=1, bias=bias)
 
     def forward(self, x):
         return self.proj(x)
-
-
-class Downsample(nn.Module):
-    def __init__(self, n_feat, bias=False):
-        super().__init__()
-        self.body = nn.Sequential(
-            nn.Conv2d(n_feat, n_feat // 2, kernel_size=3, stride=1, padding=1, bias=bias),
-            nn.PixelUnshuffle(2)
-        )
-
-    def forward(self, x):
-        return self.body(x)
-
-
-class Upsample(nn.Module):
-    def __init__(self, n_feat, bias=False):
-        super().__init__()
-        self.body = nn.Sequential(
-            nn.Conv2d(n_feat, n_feat * 2, kernel_size=3, stride=1, padding=1, bias=bias),
-            nn.PixelShuffle(2)
-        )
-
-    def forward(self, x):
-        return self.body(x)

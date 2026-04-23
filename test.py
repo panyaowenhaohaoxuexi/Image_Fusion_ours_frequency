@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.CRITICAL)
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-ckpt_path = r'./models/HighLevelGuidedFreqFusion_Clean_latest.pth'
+ckpt_path = r'/root/Image_Fusion_ours_frequency_v1/models/HighLevelGuidedFreqFusion_Clean_latest.pth'
 
 
 def _load_state(module, checkpoint, new_key, old_key):
@@ -28,7 +28,7 @@ def _load_state(module, checkpoint, new_key, old_key):
     raise KeyError(f'Checkpoint missing both {new_key} and {old_key}.')
 
 
-for dataset_name in ["TNO"]:
+for dataset_name in ["MSRS"]:
     print("\n" * 2 + "=" * 80)
     print("The test result of " + dataset_name + ' :')
     path = './test_img/'

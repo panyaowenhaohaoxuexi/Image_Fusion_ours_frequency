@@ -16,41 +16,32 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 
-def maybe_parallel(module: nn.Module, device: str):
-    module = module.to(device)
-    if device == 'cuda' and torch.cuda.device_count() > 1:
-        module = nn.DataParallel(module)
-    return module
-
-
 def build_model(device: str):
-    encoder = maybe_parallel(
+    encoder = nn.DataParallel(
         SharedEncoder(
             inp_channels=1,
             feature_dim=64,
-            inner_dim=32,
-            num_blocks=(1, 1, 2),
-            num_heads=(1, 2, 4),
+            inner_dim=24,
+            num_blocks=1,
+            num_heads=1,
             ffn_expansion_factor=2.0
-        ),
-        device
-    )
+        )
+    ).to(device)
 
-    decoder = maybe_parallel(
+    decoder = nn.DataParallel(
         FusionDecoder(
             channels=64,
             out_channels=1,
-            inner_dim=32,
-            num_blocks=(1, 1, 2),
-            num_heads=(1, 2, 4),
+            inner_dim=24,
+            num_blocks=1,
+            num_heads=1,
             ffn_expansion_factor=2.0
-        ),
-        device
-    )
+        )
+    ).to(device)
 
-    base_fusion = maybe_parallel(BaseFusion(channels=64), device)
+    base_fusion = nn.DataParallel(BaseFusion(channels=64)).to(device)
 
-    freq_fusion = maybe_parallel(
+    freq_fusion = nn.DataParallel(
         HighLevelGuidedFrequencyFusion(
             in_channels=64,
             patch_size=4,
@@ -58,9 +49,8 @@ def build_model(device: str):
             phase_topk_ratio=0.25,
             token_embed_dim=128,
             num_heads=4
-        ),
-        device
-    )
+        )
+    ).to(device)
 
     return encoder, decoder, base_fusion, freq_fusion
 
@@ -75,12 +65,13 @@ def save_checkpoint(path: str, encoder, decoder, base_fusion, freq_fusion):
     torch.save(checkpoint, path)
 
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 criteria_fusion = Fusionloss().to(device)
 criteria_ssim = SimpleSSIMLoss(window_size=11).to(device)
 criteria_freq = FrequencyConsistencyLoss(low_weight=1.0, high_weight=1.0).to(device)
 
-num_epochs = 5
+num_epochs = 70
 lr = 1e-4
 weight_decay = 0.0
 batch_size = 8
@@ -91,6 +82,7 @@ clip_grad_norm_value = 0.01
 optim_step = 20
 optim_gamma = 0.5
 
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 shared_encoder, fusion_decoder, base_fusion, frequency_fusion = build_model(device)
 
 optimizer1 = torch.optim.Adam(shared_encoder.parameters(), lr=lr, weight_decay=weight_decay)
@@ -103,7 +95,7 @@ scheduler2 = torch.optim.lr_scheduler.StepLR(optimizer2, step_size=optim_step, g
 scheduler3 = torch.optim.lr_scheduler.StepLR(optimizer3, step_size=optim_step, gamma=optim_gamma)
 scheduler4 = torch.optim.lr_scheduler.StepLR(optimizer4, step_size=optim_step, gamma=optim_gamma)
 
-trainloader = DataLoader(H5Dataset(r"E:\yizuo_SCI\2_Datasets\MSRS_train_imgsize_128_stride_200.h5"), batch_size=batch_size, shuffle=True, num_workers=0)
+trainloader = DataLoader(H5Dataset(r"/root/autodl-tmp/MSRS_train_imgsize_128_stride_200.h5"), batch_size=batch_size, shuffle=True, num_workers=0)
 loader = {'train': trainloader}
 timestamp = datetime.datetime.now().strftime("%m-%d-%H-%M")
 
@@ -120,8 +112,7 @@ for epoch in range(num_epochs):
         ir_base, ir_freq, _ = shared_encoder(data_ir)
         fused_base = base_fusion(vis_base, ir_base)
         fused_freq = frequency_fusion(vis_freq, ir_freq)
-        decoder_skip = 0.5 * (data_vis + data_ir)
-        fused_image, _ = fusion_decoder(decoder_skip, fused_base, fused_freq)
+        fused_image, _ = fusion_decoder(data_vis, fused_base, fused_freq)
 
         fusion_loss, _, _ = criteria_fusion(data_vis, data_ir, fused_image)
         ssim_loss = criteria_ssim(fused_image, data_vis) + criteria_ssim(fused_image, data_ir)
