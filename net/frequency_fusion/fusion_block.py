@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import torch
 import torch.nn as nn
-from .prompt import FixedPromptBank, IntentRouter
+from .prompt import FixedPromptBank, CLIPTextPromptBank, IntentRouter
 from .fft_utils import split_amplitude_phase, phase_wrap, rebuild_from_amplitude_phase, patchify_feature_map, unpatchify_feature_map
 from .scoring import TokenScoreNet
 from .selection import topk_token_selection, gather_tokens, scatter_tokens
@@ -14,7 +14,9 @@ class HighLevelGuidedFrequencyFusion(nn.Module):
 
     def __init__(self, in_channels: int = 64, patch_size: int = 4, prior_dim: int = 64,
                  amp_topk_ratio: float = 0.25, phase_topk_ratio: float = 0.25,
-                 token_embed_dim: int = 128, num_heads: int = 4, return_aux: bool = False):
+                 token_embed_dim: int = 128, num_heads: int = 4, return_aux: bool = False,
+                 use_real_clip_prompt_bank: bool = False, clip_model_name: str = 'ViT-B/32',
+                 prompt_texts=None, clip_download_root: str = None, clip_device: str = None):
         super().__init__()
         self.patch_size = patch_size
         self.amp_topk_ratio = amp_topk_ratio
@@ -22,13 +24,33 @@ class HighLevelGuidedFrequencyFusion(nn.Module):
         self.return_aux = return_aux
         token_dim = in_channels * patch_size * patch_size
 
-        self.prompt_bank = FixedPromptBank(prior_dim=prior_dim)
-        self.intent_router = IntentRouter(in_channels=in_channels, prior_dim=prior_dim, num_prompts=4)
+        if prompt_texts is None:
+            prompt_texts = [
+                'salient targets',
+                'structural contours',
+                'fine textures',
+                'balanced fusion',
+            ]
+
+        if use_real_clip_prompt_bank:
+            self.prompt_bank = CLIPTextPromptBank(
+                prior_dim=prior_dim,
+                clip_model_name=clip_model_name,
+                prompt_texts=prompt_texts,
+                download_root=clip_download_root,
+                clip_device=clip_device,
+            )
+            num_prompts = len(prompt_texts)
+        else:
+            self.prompt_bank = FixedPromptBank(prior_dim=prior_dim)
+            num_prompts = 4
+
+        self.intent_router = IntentRouter(in_channels=in_channels, prior_dim=prior_dim, num_prompts=num_prompts)
 
         self.amp_score = TokenScoreNet(token_dim=token_dim, prior_dim=prior_dim, hidden_dim=token_embed_dim)
         self.phase_score = TokenScoreNet(token_dim=token_dim, prior_dim=prior_dim, hidden_dim=token_embed_dim)
-        self.amp_interaction = SelectedTokenInteraction(token_dim=token_dim, embed_dim=token_embed_dim, num_heads=num_heads, intent_dim=prior_dim)
-        self.phase_interaction = SelectedTokenInteraction(token_dim=token_dim, embed_dim=token_embed_dim, num_heads=num_heads, intent_dim=prior_dim)
+        self.amp_interaction = SelectedTokenInteraction(token_dim=token_dim, embed_dim=token_embed_dim, num_heads=num_heads, prior_dim=prior_dim)
+        self.phase_interaction = SelectedTokenInteraction(token_dim=token_dim, embed_dim=token_embed_dim, num_heads=num_heads, prior_dim=prior_dim)
         self.amp_bypass = LightweightTokenPreserver(token_dim=token_dim)
         self.phase_bypass = LightweightTokenPreserver(token_dim=token_dim)
 
@@ -40,7 +62,7 @@ class HighLevelGuidedFrequencyFusion(nn.Module):
         self.refine_affine = nn.Sequential(
             nn.Linear(prior_dim, in_channels * 2),
             nn.GELU(),
-            nn.Linear(in_channels * 2, in_channels * 2),
+            nn.Linear(in_channels * 2, in_channels * 2)
         )
 
     def _fuse_branch(self, vis_map, ir_map, intent, scorer, interactor, bypass, keep_ratio):

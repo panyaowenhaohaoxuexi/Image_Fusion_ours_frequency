@@ -9,13 +9,6 @@ import logging
 
 from net.Network import SharedEncoder, FusionDecoder, BaseFusion
 from net.frequency_fusion import HighLevelGuidedFrequencyFusion
-
-
-def maybe_parallel(module: nn.Module, device: str):
-    module = module.to(device)
-    if device == 'cuda' and torch.cuda.device_count() > 1:
-        module = nn.DataParallel(module)
-    return module
 from utils.img_read_save import img_save, image_read_cv2
 
 warnings.filterwarnings("ignore")
@@ -24,33 +17,26 @@ logging.basicConfig(level=logging.CRITICAL)
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 ckpt_path = r'/root/Image_Fusion_ours_frequency_v1/models/HighLevelGuidedFreqFusion_Clean_latest.pth'
 
-
-def _safe_load_state_dict(module, state_dict):
-    try:
-        module.load_state_dict(state_dict)
-        return
-    except RuntimeError:
-        pass
-
-    # 兼容 DataParallel / 非 DataParallel 权重前缀差异
-    if len(state_dict) == 0:
-        raise RuntimeError('Empty state_dict.')
-
-    first_key = next(iter(state_dict.keys()))
-    if first_key.startswith('module.'):
-        stripped = {k[7:]: v for k, v in state_dict.items()}
-        module.load_state_dict(stripped)
-    else:
-        wrapped = {'module.' + k: v for k, v in state_dict.items()}
-        module.load_state_dict(wrapped)
+# =========================
+# CLIP 语义引导配置
+# =========================
+USE_REAL_CLIP_PROMPT_BANK = False
+CLIP_MODEL_NAME = 'ViT-B/32'
+CLIP_DOWNLOAD_ROOT = None
+PROMPT_TEXTS = [
+    'salient targets',
+    'structural contours',
+    'fine textures',
+    'balanced fusion',
+]
 
 
 def _load_state(module, checkpoint, new_key, old_key):
     if new_key in checkpoint:
-        _safe_load_state_dict(module, checkpoint[new_key])
+        module.load_state_dict(checkpoint[new_key])
         return
     if old_key in checkpoint:
-        _safe_load_state_dict(module, checkpoint[old_key])
+        module.load_state_dict(checkpoint[old_key])
         return
     raise KeyError(f'Checkpoint missing both {new_key} and {old_key}.')
 
@@ -64,10 +50,23 @@ for dataset_name in ["MSRS"]:
     os.makedirs(test_out_folder, exist_ok=True)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    encoder = maybe_parallel(SharedEncoder(inp_channels=1, feature_dim=64), device)
-    decoder = maybe_parallel(FusionDecoder(channels=64, out_channels=1), device)
-    base_fusion = maybe_parallel(BaseFusion(channels=64), device)
-    frequency_fusion = maybe_parallel(HighLevelGuidedFrequencyFusion(in_channels=64, patch_size=4, amp_topk_ratio=0.25, phase_topk_ratio=0.25, token_embed_dim=128, num_heads=4), device)
+    encoder = nn.DataParallel(SharedEncoder(inp_channels=1, feature_dim=64)).to(device)
+    decoder = nn.DataParallel(FusionDecoder(channels=64, out_channels=1)).to(device)
+    base_fusion = nn.DataParallel(BaseFusion(channels=64)).to(device)
+    frequency_fusion = nn.DataParallel(
+        HighLevelGuidedFrequencyFusion(
+            in_channels=64,
+            patch_size=4,
+            amp_topk_ratio=0.25,
+            phase_topk_ratio=0.25,
+            token_embed_dim=128,
+            num_heads=4,
+            use_real_clip_prompt_bank=USE_REAL_CLIP_PROMPT_BANK,
+            clip_model_name=CLIP_MODEL_NAME,
+            prompt_texts=PROMPT_TEXTS,
+            clip_download_root=CLIP_DOWNLOAD_ROOT,
+        )
+    ).to(device)
 
     checkpoint = torch.load(ckpt_path, map_location=device)
     _load_state(encoder, checkpoint, 'shared_encoder', 'DIDF_Encoder')
