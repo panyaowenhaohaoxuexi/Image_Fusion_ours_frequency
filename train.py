@@ -10,14 +10,21 @@ from torch.utils.data import DataLoader
 from net.Network import SharedEncoder, FusionDecoder, BaseFusion
 from net.frequency_fusion import HighLevelGuidedFrequencyFusion
 from utils.dataset import H5Dataset
-from utils.loss import Fusionloss, SimpleSSIMLoss, FrequencyConsistencyLoss
+from utils.loss import Fusionloss, SimpleSSIMLoss, FrequencyConsistencyLoss, FocalFrequencyLoss
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 
+def maybe_parallel(module: nn.Module, device: str):
+    module = module.to(device)
+    if device == 'cuda' and torch.cuda.device_count() > 1:
+        module = nn.DataParallel(module)
+    return module
+
+
 def build_model(device: str):
-    encoder = nn.DataParallel(
+    encoder = maybe_parallel(
         SharedEncoder(
             inp_channels=1,
             feature_dim=64,
@@ -25,10 +32,11 @@ def build_model(device: str):
             num_blocks=1,
             num_heads=1,
             ffn_expansion_factor=2.0
-        )
-    ).to(device)
+        ),
+        device
+    )
 
-    decoder = nn.DataParallel(
+    decoder = maybe_parallel(
         FusionDecoder(
             channels=64,
             out_channels=1,
@@ -36,12 +44,13 @@ def build_model(device: str):
             num_blocks=1,
             num_heads=1,
             ffn_expansion_factor=2.0
-        )
-    ).to(device)
+        ),
+        device
+    )
 
-    base_fusion = nn.DataParallel(BaseFusion(channels=64)).to(device)
+    base_fusion = maybe_parallel(BaseFusion(channels=64), device)
 
-    freq_fusion = nn.DataParallel(
+    freq_fusion = maybe_parallel(
         HighLevelGuidedFrequencyFusion(
             in_channels=64,
             patch_size=4,
@@ -49,8 +58,9 @@ def build_model(device: str):
             phase_topk_ratio=0.25,
             token_embed_dim=128,
             num_heads=4
-        )
-    ).to(device)
+        ),
+        device
+    )
 
     return encoder, decoder, base_fusion, freq_fusion
 
@@ -70,6 +80,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 criteria_fusion = Fusionloss().to(device)
 criteria_ssim = SimpleSSIMLoss(window_size=11).to(device)
 criteria_freq = FrequencyConsistencyLoss(low_weight=1.0, high_weight=1.0).to(device)
+criteria_ffl = FocalFrequencyLoss(alpha=1.0, log_amplitude=True).to(device)
 
 num_epochs = 70
 lr = 1e-4
@@ -78,6 +89,7 @@ batch_size = 8
 coeff_fusion = 1.0
 coeff_ssim = 2.0
 coeff_freq = 0.5
+coeff_ffl = 0.15
 clip_grad_norm_value = 0.01
 optim_step = 20
 optim_gamma = 0.5
@@ -112,12 +124,14 @@ for epoch in range(num_epochs):
         ir_base, ir_freq, _ = shared_encoder(data_ir)
         fused_base = base_fusion(vis_base, ir_base)
         fused_freq = frequency_fusion(vis_freq, ir_freq)
-        fused_image, _ = fusion_decoder(data_vis, fused_base, fused_freq)
+        decoder_skip = 0.5 * (data_vis + data_ir)
+        fused_image, _ = fusion_decoder(decoder_skip, fused_base, fused_freq)
 
         fusion_loss, _, _ = criteria_fusion(data_vis, data_ir, fused_image)
         ssim_loss = criteria_ssim(fused_image, data_vis) + criteria_ssim(fused_image, data_ir)
         freq_loss, _, _ = criteria_freq(data_vis, data_ir, fused_image)
-        loss = coeff_fusion * fusion_loss + coeff_ssim * ssim_loss + coeff_freq * freq_loss
+        ffl_loss, _, _ = criteria_ffl(data_vis, data_ir, fused_image)
+        loss = coeff_fusion * fusion_loss + coeff_ssim * ssim_loss + coeff_freq * freq_loss + coeff_ffl * ffl_loss
         loss.backward()
 
         nn.utils.clip_grad_norm_(shared_encoder.parameters(), max_norm=clip_grad_norm_value, norm_type=2)

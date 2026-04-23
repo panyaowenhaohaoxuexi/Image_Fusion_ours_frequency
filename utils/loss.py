@@ -114,3 +114,38 @@ def cc(img1: torch.Tensor, img2: torch.Tensor):
         * torch.sqrt(torch.sum(img2 ** 2, dim=-1))
     )
     return torch.clamp(corr, -1.0, 1.0).mean()
+
+class FocalFrequencyLoss(nn.Module):
+    """
+    轻量 focal frequency loss。
+    目标：提升高频/边缘频谱保真，补足 VIF/QABF/EN。
+    """
+    def __init__(self, alpha: float = 1.0, log_amplitude: bool = True):
+        super().__init__()
+        self.alpha = alpha
+        self.log_amplitude = log_amplitude
+
+    def forward(self, image_vis: torch.Tensor, image_ir: torch.Tensor, fused: torch.Tensor):
+        vis = image_vis[:, :1, :, :]
+        ir = image_ir[:, :1, :, :]
+
+        fused_fft = torch.fft.rfft2(fused, dim=(-2, -1), norm='ortho')
+        vis_fft = torch.fft.rfft2(vis, dim=(-2, -1), norm='ortho')
+        ir_fft = torch.fft.rfft2(ir, dim=(-2, -1), norm='ortho')
+
+        fused_amp = torch.abs(fused_fft)
+        vis_amp = torch.abs(vis_fft)
+        ir_amp = torch.abs(ir_fft)
+
+        target_amp = torch.max(vis_amp, ir_amp)
+
+        if self.log_amplitude:
+            fused_amp = torch.log1p(fused_amp)
+            target_amp = torch.log1p(target_amp)
+
+        diff = torch.abs(fused_amp - target_amp)
+        weight = (diff + 1e-6).pow(self.alpha)
+        weight = weight / (weight.mean(dim=(-2, -1), keepdim=True) + 1e-6)
+
+        loss = (weight * diff).mean()
+        return loss, diff.mean(), weight.mean()
