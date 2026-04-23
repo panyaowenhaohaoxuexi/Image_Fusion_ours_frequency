@@ -20,9 +20,9 @@ ckpt_path = r'/root/Image_Fusion_ours_frequency_v1/models/HighLevelGuidedFreqFus
 # =========================
 # CLIP 语义引导配置
 # =========================
-USE_REAL_CLIP_PROMPT_BANK = False
-CLIP_MODEL_NAME = 'ViT-B/32'
-CLIP_DOWNLOAD_ROOT = None
+USE_REAL_CLIP_PROMPT_BANK = True
+CLIP_MODEL_NAME = r'E:\yizuo_SCI\Code\Image_Fusion_ours_frequency\weight\clip\ViT-B-32.pt'
+CLIP_DOWNLOAD_ROOT = r'E:\yizuo_SCI\weights\clip'
 PROMPT_TEXTS = [
     'salient targets',
     'structural contours',

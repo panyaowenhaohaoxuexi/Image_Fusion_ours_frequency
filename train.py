@@ -18,9 +18,9 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 # =========================
 # CLIP 语义引导配置
 # =========================
-USE_REAL_CLIP_PROMPT_BANK = False
-CLIP_MODEL_NAME = 'ViT-B/32'
-CLIP_DOWNLOAD_ROOT = None
+USE_REAL_CLIP_PROMPT_BANK = True
+CLIP_MODEL_NAME = r'E:\yizuo_SCI\Code\Image_Fusion_ours_frequency\weight\clip\ViT-B-32.pt'
+CLIP_DOWNLOAD_ROOT = r'E:\yizuo_SCI\weights\clip'
 PROMPT_TEXTS = [
     'salient targets',
     'structural contours',
@@ -102,17 +102,17 @@ optim_gamma = 0.5
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 shared_encoder, fusion_decoder, base_fusion, frequency_fusion = build_model(device)
 
-optimizer1 = torch.optim.Adam(shared_encoder.parameters(), lr=lr, weight_decay=weight_decay)
-optimizer2 = torch.optim.Adam(fusion_decoder.parameters(), lr=lr, weight_decay=weight_decay)
-optimizer3 = torch.optim.Adam(base_fusion.parameters(), lr=lr, weight_decay=weight_decay)
-optimizer4 = torch.optim.Adam(frequency_fusion.parameters(), lr=lr, weight_decay=weight_decay)
+optimizer1 = torch.optim.Adam(filter(lambda p: p.requires_grad, shared_encoder.parameters()), lr=lr, weight_decay=weight_decay)
+optimizer2 = torch.optim.Adam(filter(lambda p: p.requires_grad, fusion_decoder.parameters()), lr=lr, weight_decay=weight_decay)
+optimizer3 = torch.optim.Adam(filter(lambda p: p.requires_grad, base_fusion.parameters()), lr=lr, weight_decay=weight_decay)
+optimizer4 = torch.optim.Adam(filter(lambda p: p.requires_grad, frequency_fusion.parameters()), lr=lr, weight_decay=weight_decay)
 
 scheduler1 = torch.optim.lr_scheduler.StepLR(optimizer1, step_size=optim_step, gamma=optim_gamma)
 scheduler2 = torch.optim.lr_scheduler.StepLR(optimizer2, step_size=optim_step, gamma=optim_gamma)
 scheduler3 = torch.optim.lr_scheduler.StepLR(optimizer3, step_size=optim_step, gamma=optim_gamma)
 scheduler4 = torch.optim.lr_scheduler.StepLR(optimizer4, step_size=optim_step, gamma=optim_gamma)
 
-trainloader = DataLoader(H5Dataset(r"/root/autodl-tmp/MSRS_train_imgsize_128_stride_200.h5"), batch_size=batch_size, shuffle=True, num_workers=0)
+trainloader = DataLoader(H5Dataset(r"E:\yizuo_SCI\2_Datasets\MSRS\MSRS_train_imgsize_128_stride_200.h5"), batch_size=batch_size, shuffle=True, num_workers=0)
 loader = {'train': trainloader}
 timestamp = datetime.datetime.now().strftime("%m-%d-%H-%M")
 

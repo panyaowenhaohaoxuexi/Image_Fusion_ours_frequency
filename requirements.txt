@@ -7,6 +7,9 @@ scikit_learn==1.1.3
 scipy==1.7.3
 tensorboardX==2.5.1
 timm==0.4.12
-torch==1.8.1+cu111
 tqdm
 h5py
+
+openai-clip==1.0.1
+ftfy
+regex
