@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from net.Network import SharedEncoder, FusionDecoder, BaseFusion
+from net.Network import SharedEncoder, FusionDecoder, BaseFusion, SpatialResidualCompensation
 from net.frequency_fusion import HighLevelGuidedFrequencyFusion
 from utils.dataset import H5Dataset
 from utils.loss import Fusionloss, SimpleSSIMLoss, FrequencyConsistencyLoss
@@ -26,6 +26,7 @@ PROMPT_TEXTS = [
     'structural contours',
     'fine textures',
     'balanced fusion',
+    'low light enhancement',
 ]
 
 
@@ -54,6 +55,13 @@ def build_model(device: str):
 
     base_fusion = nn.DataParallel(BaseFusion(channels=64)).to(device)
 
+    spatial_compensation = nn.DataParallel(
+        SpatialResidualCompensation(
+            channels=64,
+            init_scale=0.1
+        )
+    ).to(device)
+
     freq_fusion = nn.DataParallel(
         HighLevelGuidedFrequencyFusion(
             in_channels=64,
@@ -69,15 +77,16 @@ def build_model(device: str):
         )
     ).to(device)
 
-    return encoder, decoder, base_fusion, freq_fusion
+    return encoder, decoder, base_fusion, freq_fusion, spatial_compensation
 
 
-def save_checkpoint(path: str, encoder, decoder, base_fusion, freq_fusion):
+def save_checkpoint(path: str, encoder, decoder, base_fusion, freq_fusion, spatial_compensation):
     checkpoint = {
         'shared_encoder': encoder.state_dict(),
         'fusion_decoder': decoder.state_dict(),
         'base_fusion': base_fusion.state_dict(),
         'frequency_fusion': freq_fusion.state_dict(),
+        'spatial_compensation': spatial_compensation.state_dict(),
     }
     torch.save(checkpoint, path)
 
@@ -100,17 +109,19 @@ optim_step = 20
 optim_gamma = 0.5
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-shared_encoder, fusion_decoder, base_fusion, frequency_fusion = build_model(device)
+shared_encoder, fusion_decoder, base_fusion, frequency_fusion, spatial_compensation = build_model(device)
 
 optimizer1 = torch.optim.Adam(filter(lambda p: p.requires_grad, shared_encoder.parameters()), lr=lr, weight_decay=weight_decay)
 optimizer2 = torch.optim.Adam(filter(lambda p: p.requires_grad, fusion_decoder.parameters()), lr=lr, weight_decay=weight_decay)
 optimizer3 = torch.optim.Adam(filter(lambda p: p.requires_grad, base_fusion.parameters()), lr=lr, weight_decay=weight_decay)
 optimizer4 = torch.optim.Adam(filter(lambda p: p.requires_grad, frequency_fusion.parameters()), lr=lr, weight_decay=weight_decay)
+optimizer5 = torch.optim.Adam(filter(lambda p: p.requires_grad, spatial_compensation.parameters()), lr=lr, weight_decay=weight_decay)
 
 scheduler1 = torch.optim.lr_scheduler.StepLR(optimizer1, step_size=optim_step, gamma=optim_gamma)
 scheduler2 = torch.optim.lr_scheduler.StepLR(optimizer2, step_size=optim_step, gamma=optim_gamma)
 scheduler3 = torch.optim.lr_scheduler.StepLR(optimizer3, step_size=optim_step, gamma=optim_gamma)
 scheduler4 = torch.optim.lr_scheduler.StepLR(optimizer4, step_size=optim_step, gamma=optim_gamma)
+scheduler5 = torch.optim.lr_scheduler.StepLR(optimizer5, step_size=optim_step, gamma=optim_gamma)
 
 trainloader = DataLoader(H5Dataset(r"E:\yizuo_SCI\2_Datasets\MSRS\MSRS_train_imgsize_128_stride_200.h5"), batch_size=batch_size, shuffle=True, num_workers=0)
 loader = {'train': trainloader}
@@ -122,13 +133,14 @@ prev_time = time.time()
 for epoch in range(num_epochs):
     for i, (data_vis, data_ir) in enumerate(loader['train']):
         data_vis, data_ir = data_vis.to(device), data_ir.to(device)
-        shared_encoder.train(); fusion_decoder.train(); base_fusion.train(); frequency_fusion.train()
-        optimizer1.zero_grad(); optimizer2.zero_grad(); optimizer3.zero_grad(); optimizer4.zero_grad()
+        shared_encoder.train(); fusion_decoder.train(); base_fusion.train(); frequency_fusion.train(); spatial_compensation.train()
+        optimizer1.zero_grad(); optimizer2.zero_grad(); optimizer3.zero_grad(); optimizer4.zero_grad(); optimizer5.zero_grad()
 
         vis_base, vis_freq, _ = shared_encoder(data_vis)
         ir_base, ir_freq, _ = shared_encoder(data_ir)
-        fused_base = base_fusion(vis_base, ir_base)
+        fused_base_init = base_fusion(vis_base, ir_base)
         fused_freq = frequency_fusion(vis_freq, ir_freq)
+        fused_base = spatial_compensation(fused_base_init, fused_freq, vis_base, ir_base)
         decoder_skip = 0.5 * (data_vis + data_ir)
         fused_image, _ = fusion_decoder(decoder_skip, fused_base, fused_freq)
 
@@ -142,7 +154,8 @@ for epoch in range(num_epochs):
         nn.utils.clip_grad_norm_(fusion_decoder.parameters(), max_norm=clip_grad_norm_value, norm_type=2)
         nn.utils.clip_grad_norm_(base_fusion.parameters(), max_norm=clip_grad_norm_value, norm_type=2)
         nn.utils.clip_grad_norm_(frequency_fusion.parameters(), max_norm=clip_grad_norm_value, norm_type=2)
-        optimizer1.step(); optimizer2.step(); optimizer3.step(); optimizer4.step()
+        nn.utils.clip_grad_norm_(spatial_compensation.parameters(), max_norm=clip_grad_norm_value, norm_type=2)
+        optimizer1.step(); optimizer2.step(); optimizer3.step(); optimizer4.step(); optimizer5.step()
 
         batches_done = epoch * len(loader['train']) + i
         batches_left = num_epochs * len(loader['train']) - batches_done
@@ -150,11 +163,11 @@ for epoch in range(num_epochs):
         prev_time = time.time()
         sys.stdout.write("\r[Epoch %d/%d] [Batch %d/%d] [loss: %f] ETA: %.10s" % (epoch, num_epochs, i, len(loader['train']), loss.item(), time_left))
 
-    scheduler1.step(); scheduler2.step(); scheduler3.step(); scheduler4.step()
-    for optimizer in [optimizer1, optimizer2, optimizer3, optimizer4]:
+    scheduler1.step(); scheduler2.step(); scheduler3.step(); scheduler4.step(); scheduler5.step()
+    for optimizer in [optimizer1, optimizer2, optimizer3, optimizer4, optimizer5]:
         if optimizer.param_groups[0]['lr'] <= 1e-6:
             optimizer.param_groups[0]['lr'] = 1e-6
 
 os.makedirs('models', exist_ok=True)
-save_checkpoint(os.path.join('models', 'HighLevelGuidedFreqFusion_Clean_' + timestamp + '.pth'), shared_encoder, fusion_decoder, base_fusion, frequency_fusion)
-save_checkpoint(os.path.join('models', 'HighLevelGuidedFreqFusion_Clean_latest.pth'), shared_encoder, fusion_decoder, base_fusion, frequency_fusion)
+save_checkpoint(os.path.join('models', 'HighLevelGuidedFreqFusion_Clean_' + timestamp + '.pth'), shared_encoder, fusion_decoder, base_fusion, frequency_fusion, spatial_compensation)
+save_checkpoint(os.path.join('models', 'HighLevelGuidedFreqFusion_Clean_latest.pth'), shared_encoder, fusion_decoder, base_fusion, frequency_fusion, spatial_compensation)

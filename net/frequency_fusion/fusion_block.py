@@ -30,6 +30,7 @@ class HighLevelGuidedFrequencyFusion(nn.Module):
                 'structural contours',
                 'fine textures',
                 'balanced fusion',
+                'low light enhancement',
             ]
 
         if use_real_clip_prompt_bank:

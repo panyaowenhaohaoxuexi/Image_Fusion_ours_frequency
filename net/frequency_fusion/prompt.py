@@ -51,6 +51,7 @@ class CLIPTextPromptBank(nn.Module):
                 'structural contours',
                 'fine textures',
                 'balanced fusion',
+                'low light enhancement',
             ]
         self.prompt_texts = list(prompt_texts)
         self.prompt_names = list(prompt_texts)
