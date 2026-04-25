@@ -58,7 +58,7 @@ def build_model(device: str):
     spatial_compensation = nn.DataParallel(
         SpatialResidualCompensation(
             channels=64,
-            init_scale=0.1
+            init_scale=0.03
         )
     ).to(device)
 
@@ -66,8 +66,8 @@ def build_model(device: str):
         HighLevelGuidedFrequencyFusion(
             in_channels=64,
             patch_size=4,
-            amp_topk_ratio=0.25,
-            phase_topk_ratio=0.25,
+            amp_topk_ratio=0.30,
+            phase_topk_ratio=0.35,
             token_embed_dim=128,
             num_heads=4,
             use_real_clip_prompt_bank=USE_REAL_CLIP_PROMPT_BANK,
@@ -115,7 +115,7 @@ optimizer1 = torch.optim.Adam(filter(lambda p: p.requires_grad, shared_encoder.p
 optimizer2 = torch.optim.Adam(filter(lambda p: p.requires_grad, fusion_decoder.parameters()), lr=lr, weight_decay=weight_decay)
 optimizer3 = torch.optim.Adam(filter(lambda p: p.requires_grad, base_fusion.parameters()), lr=lr, weight_decay=weight_decay)
 optimizer4 = torch.optim.Adam(filter(lambda p: p.requires_grad, frequency_fusion.parameters()), lr=lr, weight_decay=weight_decay)
-optimizer5 = torch.optim.Adam(filter(lambda p: p.requires_grad, spatial_compensation.parameters()), lr=lr, weight_decay=weight_decay)
+optimizer5 = torch.optim.Adam(filter(lambda p: p.requires_grad, spatial_compensation.parameters()), lr=lr * 0.5, weight_decay=weight_decay)
 
 scheduler1 = torch.optim.lr_scheduler.StepLR(optimizer1, step_size=optim_step, gamma=optim_gamma)
 scheduler2 = torch.optim.lr_scheduler.StepLR(optimizer2, step_size=optim_step, gamma=optim_gamma)

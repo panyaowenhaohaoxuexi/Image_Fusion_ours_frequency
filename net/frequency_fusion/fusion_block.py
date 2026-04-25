@@ -52,8 +52,8 @@ class HighLevelGuidedFrequencyFusion(nn.Module):
         self.phase_score = TokenScoreNet(token_dim=token_dim, prior_dim=prior_dim, hidden_dim=token_embed_dim)
         self.amp_interaction = SelectedTokenInteraction(token_dim=token_dim, embed_dim=token_embed_dim, num_heads=num_heads, prior_dim=prior_dim)
         self.phase_interaction = SelectedTokenInteraction(token_dim=token_dim, embed_dim=token_embed_dim, num_heads=num_heads, prior_dim=prior_dim)
-        self.amp_bypass = LightweightTokenPreserver(token_dim=token_dim)
-        self.phase_bypass = LightweightTokenPreserver(token_dim=token_dim)
+        self.amp_bypass = LightweightTokenPreserver(token_dim=token_dim, prior_dim=prior_dim)
+        self.phase_bypass = LightweightTokenPreserver(token_dim=token_dim, prior_dim=prior_dim)
 
         self.refine = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 3, 1, 1),
@@ -74,7 +74,7 @@ class HighLevelGuidedFrequencyFusion(nn.Module):
         vis_selected = gather_tokens(vis_tokens, topk_index)
         ir_selected = gather_tokens(ir_tokens, topk_index)
         fused_selected = interactor(vis_selected, ir_selected, intent)
-        fused_full = bypass(vis_tokens, ir_tokens)
+        fused_full = bypass(vis_tokens, ir_tokens, intent)
         fused_full = scatter_tokens(fused_full, fused_selected, topk_index)
         fused_map = unpatchify_feature_map(fused_full, meta)
         aux = {'score': score, 'mask': mask.float(), 'topk_index': topk_index, 'topk_value': topk_value}
