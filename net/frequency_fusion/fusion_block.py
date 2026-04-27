@@ -55,6 +55,11 @@ class HighLevelGuidedFrequencyFusion(nn.Module):
         self.amp_bypass = LightweightTokenPreserver(token_dim=token_dim, prior_dim=prior_dim)
         self.phase_bypass = LightweightTokenPreserver(token_dim=token_dim, prior_dim=prior_dim)
 
+        # 让所有 tokens 的 score 都进入可导路径：
+        # selected tokens 通过强交互门控更新，
+        # all tokens（包括 unselected）通过轻量 score-aware retention 调制保留强度。
+        self.all_token_gate_scale = nn.Parameter(torch.tensor(0.05))
+
         self.refine = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 3, 1, 1),
             nn.ReLU(inplace=True),
@@ -69,15 +74,40 @@ class HighLevelGuidedFrequencyFusion(nn.Module):
     def _fuse_branch(self, vis_map, ir_map, intent, scorer, interactor, bypass, keep_ratio):
         vis_tokens, meta = patchify_feature_map(vis_map, self.patch_size)
         ir_tokens, _ = patchify_feature_map(ir_map, self.patch_size)
+
+        # importance score for all tokens
         score = scorer(vis_tokens, ir_tokens, meta['coords'], intent)
+        score_gate = torch.sigmoid(score).unsqueeze(-1)
+
+        # hard Top-K selection for strong interaction
         topk_index, mask, topk_value = topk_token_selection(score, keep_ratio)
         vis_selected = gather_tokens(vis_tokens, topk_index)
         ir_selected = gather_tokens(ir_tokens, topk_index)
-        fused_selected = interactor(vis_selected, ir_selected, intent)
+        cross_selected = interactor(vis_selected, ir_selected, intent)
+
+        # lightweight preservation path for all tokens
         fused_full = bypass(vis_tokens, ir_tokens, intent)
+        bypass_selected = gather_tokens(fused_full, topk_index)
+
+        # selected tokens: score controls how much cross-modal interaction overrides bypass content
+        selected_gate = torch.sigmoid(topk_value).unsqueeze(-1)
+        fused_selected = bypass_selected + selected_gate * (cross_selected - bypass_selected)
         fused_full = scatter_tokens(fused_full, fused_selected, topk_index)
+
+        # all tokens (including unselected): score-aware soft retention modulation
+        # This keeps the strong selected/unselected design, while ensuring every token score
+        # participates in a differentiable path and can receive gradient from the fusion loss.
+        gate_scale = torch.tanh(self.all_token_gate_scale)
+        fused_full = fused_full * (1.0 + gate_scale * (2.0 * score_gate - 1.0))
+
         fused_map = unpatchify_feature_map(fused_full, meta)
-        aux = {'score': score, 'mask': mask.float(), 'topk_index': topk_index, 'topk_value': topk_value}
+        aux = {
+            'score': score,
+            'score_gate': score_gate.squeeze(-1),
+            'mask': mask.float(),
+            'topk_index': topk_index,
+            'topk_value': topk_value,
+        }
         return fused_map, aux
 
     def forward(self, vis_feat: torch.Tensor, ir_feat: torch.Tensor):
@@ -104,6 +134,8 @@ class HighLevelGuidedFrequencyFusion(nn.Module):
             'phase_score': phase_aux['score'],
             'amp_mask': amp_aux['mask'],
             'phase_mask': phase_aux['mask'],
+            'amp_score_gate': amp_aux['score_gate'],
+            'phase_score_gate': phase_aux['score_gate'],
             'amp_topk_index': amp_aux['topk_index'],
             'phase_topk_index': phase_aux['topk_index'],
         }

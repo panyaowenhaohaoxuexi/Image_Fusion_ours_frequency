@@ -61,8 +61,8 @@ for dataset_name in ["MSRS"]:
         HighLevelGuidedFrequencyFusion(
             in_channels=64,
             patch_size=4,
-            amp_topk_ratio=0.25,
-            phase_topk_ratio=0.25,
+            amp_topk_ratio=0.30,
+            phase_topk_ratio=0.35,
             token_embed_dim=128,
             num_heads=4,
             use_real_clip_prompt_bank=USE_REAL_CLIP_PROMPT_BANK,
