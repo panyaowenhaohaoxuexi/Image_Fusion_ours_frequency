@@ -114,3 +114,69 @@ def cc(img1: torch.Tensor, img2: torch.Tensor):
         * torch.sqrt(torch.sum(img2 ** 2, dim=-1))
     )
     return torch.clamp(corr, -1.0, 1.0).mean()
+
+class TokenRoutingRankingLoss(nn.Module):
+    """频率 token 路由评分辅助损失。
+
+    目的：让 TokenScoreNet 学会“哪些 tokens 应排在 Top-K 前面”，而不是把 score
+    当成频谱值缩放系数。该损失作用在 amp_score / phase_score 上，前向路由仍由
+    hard Top-K 完成：高分 tokens 进入 strong interaction，低分 tokens 进入 weak path。
+    """
+
+    def __init__(self,
+                 bce_weight: float = 1.0,
+                 rank_weight: float = 0.5,
+                 separation_margin: float = 0.35,
+                 amp_weight: float = 1.0,
+                 phase_weight: float = 1.0):
+        super().__init__()
+        self.bce_weight = bce_weight
+        self.rank_weight = rank_weight
+        self.separation_margin = separation_margin
+        self.amp_weight = amp_weight
+        self.phase_weight = phase_weight
+
+    @staticmethod
+    def _normalize_score(score: torch.Tensor) -> torch.Tensor:
+        mean = score.mean(dim=1, keepdim=True)
+        std = score.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-4)
+        return (score - mean) / std
+
+    def _branch_loss(self, score: torch.Tensor, target: torch.Tensor, hard_mask: torch.Tensor):
+        score_norm = self._normalize_score(score)
+        target = target.detach().clamp(0.0, 1.0)
+        hard_mask = hard_mask.detach().float()
+
+        # soft target 约束：让排序分数贴近由 token 信息和跨模态差异得到的软重要性。
+        bce = F.binary_cross_entropy_with_logits(score_norm, target)
+
+        # selected/unselected 间隔约束：鼓励 Top-K 内平均分高于 Top-K 外平均分。
+        selected_count = hard_mask.sum(dim=1).clamp_min(1.0)
+        unselected_count = (1.0 - hard_mask).sum(dim=1).clamp_min(1.0)
+        selected_mean = (score_norm * hard_mask).sum(dim=1) / selected_count
+        unselected_mean = (score_norm * (1.0 - hard_mask)).sum(dim=1) / unselected_count
+        rank = F.relu(self.separation_margin - (selected_mean - unselected_mean)).mean()
+
+        total = self.bce_weight * bce + self.rank_weight * rank
+        return total, bce.detach(), rank.detach(), selected_mean.detach().mean(), unselected_mean.detach().mean()
+
+    def forward(self, aux: dict):
+        amp_loss, amp_bce, amp_rank, amp_sel, amp_unsel = self._branch_loss(
+            aux['amp_score'], aux['amp_score_target'], aux['amp_mask']
+        )
+        phase_loss, phase_bce, phase_rank, phase_sel, phase_unsel = self._branch_loss(
+            aux['phase_score'], aux['phase_score_target'], aux['phase_mask']
+        )
+        total = self.amp_weight * amp_loss + self.phase_weight * phase_loss
+        log = {
+            'score_loss': total.detach(),
+            'amp_score_bce': amp_bce,
+            'amp_score_rank': amp_rank,
+            'phase_score_bce': phase_bce,
+            'phase_score_rank': phase_rank,
+            'amp_selected_score_mean': amp_sel,
+            'amp_unselected_score_mean': amp_unsel,
+            'phase_selected_score_mean': phase_sel,
+            'phase_unselected_score_mean': phase_unsel,
+        }
+        return total, log

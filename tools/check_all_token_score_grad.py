@@ -1,8 +1,11 @@
-import os, sys
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 # -*- coding: utf-8 -*-
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
 import torch
 from net.frequency_fusion.fusion_block import HighLevelGuidedFrequencyFusion
+from utils.loss import TokenRoutingRankingLoss
 
 
 def main():
@@ -17,21 +20,24 @@ def main():
         num_heads=2,
         return_aux=True,
         use_real_clip_prompt_bank=False,
+        routing_temperature=0.25,
     )
+    score_criterion = TokenRoutingRankingLoss()
     vis = torch.randn(2, 8, 16, 16, requires_grad=True)
     ir = torch.randn(2, 8, 16, 16, requires_grad=True)
 
     fused, aux = model(vis, ir)
-    aux["amp_score"].retain_grad()
-    aux["phase_score"].retain_grad()
+    aux['amp_score'].retain_grad()
+    aux['phase_score'].retain_grad()
 
-    loss = fused.mean() + fused.abs().mean()
+    score_loss, _ = score_criterion(aux)
+    loss = fused.mean() + fused.abs().mean() + 0.03 * score_loss
     loss.backward()
 
-    amp_grad = aux["amp_score"].grad
-    phase_grad = aux["phase_score"].grad
-    amp_mask = aux["amp_mask"].bool()
-    phase_mask = aux["phase_mask"].bool()
+    amp_grad = aux['amp_score'].grad
+    phase_grad = aux['phase_score'].grad
+    amp_mask = aux['amp_mask'].bool()
+    phase_mask = aux['phase_mask'].bool()
 
     print('amp_score grad mean(all):', amp_grad.abs().mean().item())
     print('phase_score grad mean(all):', phase_grad.abs().mean().item())
@@ -42,6 +48,7 @@ def main():
 
     print('amp_score first layer grad mean:', model.amp_score.score_mlp[0].weight.grad.abs().mean().item())
     print('phase_score first layer grad mean:', model.phase_score.score_mlp[0].weight.grad.abs().mean().item())
+    print('score_loss:', score_loss.item())
 
 
 if __name__ == '__main__':
