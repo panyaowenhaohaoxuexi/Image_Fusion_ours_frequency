@@ -135,10 +135,11 @@ for epoch in range(num_epochs):
         fused_freq, freq_aux = freq_out
 
         spatial_intent = freq_aux['spatial_intent']
-        fused_spa = spatial_fusion(vis_spa, ir_spa, spatial_intent, fused_freq)
+        freq_context = freq_aux.get('fused_freq_levels', fused_freq)
+        fused_spa = spatial_fusion(vis_spa, ir_spa, spatial_intent, freq_context)
 
         decoder_skip = 0.5 * (data_vis + data_ir)
-        fused_image, _ = fusion_decoder(decoder_skip, fused_spa, fused_freq)
+        fused_image, _ = fusion_decoder(decoder_skip, fused_spa, fused_freq, text_intent=spatial_intent)
 
         fusion_loss, _, _ = criteria_fusion(data_vis, data_ir, fused_image)
         ssim_loss = criteria_ssim(fused_image, data_vis) + criteria_ssim(fused_image, data_ir)

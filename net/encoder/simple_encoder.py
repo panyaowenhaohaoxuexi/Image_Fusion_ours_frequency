@@ -17,9 +17,9 @@ class SimpleSharedEncoder(nn.Module):
     三层轻量 Restormer 编码器。
 
     forward 返回：
-        spatial_feats, freq_feat, shared_feat
-    其中 spatial_feats = [L1, L2, L3]，分辨率分别为 H/W、H/2/W/2、H/4/W/4。
-    频率分支仍使用最高分辨率 freq_feat 做 FFT/token routing。
+        spatial_feats, frequency_feats, shared_feat
+    其中 spatial_feats = [L1, L2, L3]，分辨率分别为 H/W、H/2/W/2、H/4/W/4；
+    frequency_feats = [F1, F2, F3]，与空间金字塔同尺度，用于三层频率域 FFT/token routing。
     """
 
     def __init__(self, inp_channels=1, feature_dim=64, inner_dim=24, num_blocks=1,
@@ -61,6 +61,16 @@ class SimpleSharedEncoder(nn.Module):
             nn.LeakyReLU(0.1, inplace=True),
             nn.Conv2d(feature_dim, feature_dim, 3, 1, 1, bias=bias),
         )
+        self.freq_l2_head = nn.Sequential(
+            nn.Conv2d(feature_dim, feature_dim, 3, 1, 1, bias=bias),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(feature_dim, feature_dim, 3, 1, 1, bias=bias),
+        )
+        self.freq_l3_head = nn.Sequential(
+            nn.Conv2d(feature_dim, feature_dim, 3, 1, 1, bias=bias),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(feature_dim, feature_dim, 3, 1, 1, bias=bias),
+        )
         self.spa_l2_refine = nn.Sequential(ConvBNAct(feature_dim, feature_dim, 3, 1, 1, 'gelu'), ResidualBlock(feature_dim))
         self.spa_l3_refine = nn.Sequential(ConvBNAct(feature_dim, feature_dim, 3, 1, 1, 'gelu'), ResidualBlock(feature_dim))
 
@@ -71,11 +81,16 @@ class SimpleSharedEncoder(nn.Module):
         low_feat = self.low_pass(shared_feat)
         high_feat = shared_feat - low_feat
         spa_l1 = self.base_head(low_feat) + low_feat
-        freq_feat = self.freq_head(high_feat) + shared_feat
+        freq_l1 = self.freq_head(high_feat) + shared_feat
 
         l2 = self.encoder_l2(self.down_l2(shared_feat))
         spa_l2 = self.spa_l2_refine(l2) + l2
+        high_l2 = l2 - self.low_pass(l2)
+        freq_l2 = self.freq_l2_head(high_l2) + l2
+
         l3 = self.encoder_l3(self.down_l3(spa_l2))
         spa_l3 = self.spa_l3_refine(l3) + l3
+        high_l3 = l3 - self.low_pass(l3)
+        freq_l3 = self.freq_l3_head(high_l3) + l3
 
-        return [spa_l1, spa_l2, spa_l3], freq_feat, shared_feat
+        return [spa_l1, spa_l2, spa_l3], [freq_l1, freq_l2, freq_l3], shared_feat

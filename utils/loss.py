@@ -118,9 +118,8 @@ def cc(img1: torch.Tensor, img2: torch.Tensor):
 class TokenRoutingRankingLoss(nn.Module):
     """频率 token 路由评分辅助损失。
 
-    目的：让 TokenScoreNet 学会“哪些 tokens 应排在 Top-K 前面”，而不是把 score
-    当成频谱值缩放系数。该损失作用在 amp_score / phase_score 上，前向路由仍由
-    hard Top-K 完成：高分 tokens 进入 strong interaction，低分 tokens 进入 weak path。
+    兼容单尺度与三层多尺度 aux。若 aux['amp_score'] / aux['phase_score'] 为 list，
+    则逐层计算 score ranking loss 后求平均。
     """
 
     def __init__(self,
@@ -142,15 +141,16 @@ class TokenRoutingRankingLoss(nn.Module):
         std = score.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-4)
         return (score - mean) / std
 
+    @staticmethod
+    def _as_list(x):
+        return x if isinstance(x, (list, tuple)) else [x]
+
     def _branch_loss(self, score: torch.Tensor, target: torch.Tensor, hard_mask: torch.Tensor):
         score_norm = self._normalize_score(score)
         target = target.detach().clamp(0.0, 1.0)
         hard_mask = hard_mask.detach().float()
 
-        # soft target 约束：让排序分数贴近由 token 信息和跨模态差异得到的软重要性。
         bce = F.binary_cross_entropy_with_logits(score_norm, target)
-
-        # selected/unselected 间隔约束：鼓励 Top-K 内平均分高于 Top-K 外平均分。
         selected_count = hard_mask.sum(dim=1).clamp_min(1.0)
         unselected_count = (1.0 - hard_mask).sum(dim=1).clamp_min(1.0)
         selected_mean = (score_norm * hard_mask).sum(dim=1) / selected_count
@@ -160,11 +160,26 @@ class TokenRoutingRankingLoss(nn.Module):
         total = self.bce_weight * bce + self.rank_weight * rank
         return total, bce.detach(), rank.detach(), selected_mean.detach().mean(), unselected_mean.detach().mean()
 
+    def _multi_branch_loss(self, scores, targets, masks):
+        scores = self._as_list(scores)
+        targets = self._as_list(targets)
+        masks = self._as_list(masks)
+        losses, bces, ranks, sels, unsels = [], [], [], [], []
+        for score, target, mask in zip(scores, targets, masks):
+            loss, bce, rank, sel, unsel = self._branch_loss(score, target, mask)
+            losses.append(loss)
+            bces.append(bce)
+            ranks.append(rank)
+            sels.append(sel)
+            unsels.append(unsel)
+        total = torch.stack(losses).mean()
+        return total, torch.stack(bces).mean(), torch.stack(ranks).mean(), torch.stack(sels).mean(), torch.stack(unsels).mean()
+
     def forward(self, aux: dict):
-        amp_loss, amp_bce, amp_rank, amp_sel, amp_unsel = self._branch_loss(
+        amp_loss, amp_bce, amp_rank, amp_sel, amp_unsel = self._multi_branch_loss(
             aux['amp_score'], aux['amp_score_target'], aux['amp_mask']
         )
-        phase_loss, phase_bce, phase_rank, phase_sel, phase_unsel = self._branch_loss(
+        phase_loss, phase_bce, phase_rank, phase_sel, phase_unsel = self._multi_branch_loss(
             aux['phase_score'], aux['phase_score_target'], aux['phase_mask']
         )
         total = self.amp_weight * amp_loss + self.phase_weight * phase_loss

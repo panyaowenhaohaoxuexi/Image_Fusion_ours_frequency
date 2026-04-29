@@ -317,14 +317,35 @@ class TextConditionedSpatialAdaptiveFusion(nn.Module):
     def _high_pass(x: torch.Tensor) -> torch.Tensor:
         return x - F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
 
+    @staticmethod
+    def _as_frequency_context(freq_feat, l1_size, l2_size, l3_size):
+        if freq_feat is None:
+            return None, None, None
+        if isinstance(freq_feat, (list, tuple)):
+            if len(freq_feat) < 3:
+                raise ValueError("frequency context pyramid must contain [L1, L2, L3].")
+            l1_freq, l2_freq, l3_freq = freq_feat[0], freq_feat[1], freq_feat[2]
+        else:
+            l1_freq = freq_feat
+            l2_freq = freq_feat
+            l3_freq = freq_feat
+        if l1_freq is not None and l1_freq.shape[-2:] != l1_size:
+            l1_freq = F.interpolate(l1_freq, size=l1_size, mode="bilinear", align_corners=False)
+        if l2_freq is not None and l2_freq.shape[-2:] != l2_size:
+            l2_freq = F.interpolate(l2_freq, size=l2_size, mode="bilinear", align_corners=False)
+        if l3_freq is not None and l3_freq.shape[-2:] != l3_size:
+            l3_freq = F.interpolate(l3_freq, size=l3_size, mode="bilinear", align_corners=False)
+        return l1_freq, l2_freq, l3_freq
+
+
     def forward(self, vis_spa: TensorOrPyramid, ir_spa: TensorOrPyramid, text_intent: torch.Tensor,
                 freq_feat: Optional[torch.Tensor] = None, return_aux: bool = False
                 ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         vis_l1, vis_l2, vis_l3 = self._as_three_levels(vis_spa)
         ir_l1, ir_l2, ir_l3 = self._as_three_levels(ir_spa)
-        l1_freq = freq_feat
-        l2_freq = F.interpolate(freq_feat, size=vis_l2.shape[-2:], mode='bilinear', align_corners=False) if freq_feat is not None else None
-        l3_freq = F.interpolate(freq_feat, size=vis_l3.shape[-2:], mode='bilinear', align_corners=False) if freq_feat is not None else None
+        l1_freq, l2_freq, l3_freq = self._as_frequency_context(
+            freq_feat, vis_l1.shape[-2:], vis_l2.shape[-2:], vis_l3.shape[-2:]
+        )
 
         fused_l1, aux_l1 = self.level1_csaf(vis_l1, ir_l1, text_intent, l1_freq)
         fused_l2, aux_l2 = self.level2_csaf(vis_l2, ir_l2, text_intent, l2_freq)
@@ -343,9 +364,7 @@ class TextConditionedSpatialAdaptiveFusion(nn.Module):
             if freq_feat is None:
                 freq_context = torch.zeros_like(vis_l1)
             else:
-                freq_context = freq_feat
-                if freq_context.shape[-2:] != vis_l1.shape[-2:]:
-                    freq_context = F.interpolate(freq_context, size=vis_l1.shape[-2:], mode='bilinear', align_corners=False)
+                freq_context = l1_freq
             gate_context.append(freq_context)
             mix_context.append(freq_context)
 
