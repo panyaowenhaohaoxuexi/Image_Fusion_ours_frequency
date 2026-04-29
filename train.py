@@ -56,6 +56,7 @@ def build_model(device: str):
             num_heads=4,
             ffn_expansion_factor=2.0,
             init_res_scale=0.05,
+            # 控制 freq_context是否进入空间域来调制
             use_freq_context=True,
         )
     ).to(device)
@@ -135,8 +136,7 @@ for epoch in range(num_epochs):
         fused_freq, freq_aux = freq_out
 
         spatial_intent = freq_aux['spatial_intent']
-        freq_context = freq_aux.get('fused_freq_levels', fused_freq)
-        fused_spa = spatial_fusion(vis_spa, ir_spa, spatial_intent, freq_context)
+        fused_spa = spatial_fusion(vis_spa, ir_spa, spatial_intent)
 
         decoder_skip = 0.5 * (data_vis + data_ir)
         fused_image, _ = fusion_decoder(decoder_skip, fused_spa, fused_freq, text_intent=spatial_intent)

@@ -68,7 +68,7 @@ for dataset_name in ['MSRS']:
         )
     ).to(device)
     spatial_fusion = nn.DataParallel(
-        TextConditionedSpatialFusion(channels=64, intent_dim=64, num_heads=4, use_freq_context=True)
+        TextConditionedSpatialFusion(channels=64, intent_dim=64, num_heads=4, use_freq_context=False)
     ).to(device)
     decoder = nn.DataParallel(FusionDecoder(channels=64, out_channels=1)).to(device)
 
@@ -91,8 +91,7 @@ for dataset_name in ['MSRS']:
             vis_spa, vis_freq, _ = encoder(data_vis)
             ir_spa, ir_freq, _ = encoder(data_ir)
             fused_freq, freq_aux = frequency_fusion(vis_freq, ir_freq)
-            freq_context = freq_aux.get('fused_freq_levels', fused_freq)
-            fused_spa = spatial_fusion(vis_spa, ir_spa, freq_aux['spatial_intent'], freq_context)
+            fused_spa = spatial_fusion(vis_spa, ir_spa, freq_aux['spatial_intent'])
             decoder_skip = 0.5 * (data_vis + data_ir)
             data_fuse, _ = decoder(decoder_skip, fused_spa, fused_freq, text_intent=freq_aux['spatial_intent'])
             data_fuse = (data_fuse - torch.min(data_fuse)) / (torch.max(data_fuse) - torch.min(data_fuse) + 1e-8)
