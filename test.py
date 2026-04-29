@@ -7,19 +7,16 @@ import torch.nn as nn
 import warnings
 import logging
 
-from net.Network import SharedEncoder, FusionDecoder, BaseFusion, SpatialResidualCompensation
+from net.Network import SharedEncoder, FusionDecoder, TextConditionedSpatialFusion
 from net.frequency_fusion import HighLevelGuidedFrequencyFusion
 from utils.img_read_save import img_save, image_read_cv2
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.CRITICAL)
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-ckpt_path = r'/root/Image_Fusion_ours_frequency_v1/models/HighLevelGuidedFreqFusion_Clean_latest.pth'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+ckpt_path = r'./models/TextIntentDualDomainFusion_latest.pth'
 
-# =========================
-# CLIP 语义引导配置
-# =========================
 USE_REAL_CLIP_PROMPT_BANK = True
 CLIP_MODEL_NAME = r'E:\yizuo_SCI\Code\Image_Fusion_ours_frequency\weight\clip\ViT-B-32.pt'
 CLIP_DOWNLOAD_ROOT = r'E:\yizuo_SCI\weights\clip'
@@ -32,21 +29,21 @@ PROMPT_TEXTS = [
 ]
 
 
-def _load_state(module, checkpoint, new_key, old_key, strict=True):
+def _load_state(module, checkpoint, new_key, old_key=None, strict=True):
     if new_key in checkpoint:
         module.load_state_dict(checkpoint[new_key], strict=strict)
         return True
-    if old_key in checkpoint:
-        module.load_state_dict(checkpoint[old_key], strict=strict)
+    if old_key is not None and old_key in checkpoint:
+        module.load_state_dict(checkpoint[old_key], strict=False)
         return True
     if strict:
-        raise KeyError(f'Checkpoint missing both {new_key} and {old_key}.')
+        raise KeyError(f'Checkpoint missing {new_key}.')
     return False
 
 
-for dataset_name in ["MSRS"]:
-    print("\n" * 2 + "=" * 80)
-    print("The test result of " + dataset_name + ' :')
+for dataset_name in ['MSRS']:
+    print('\n' * 2 + '=' * 80)
+    print('The test result of ' + dataset_name + ' :')
     path = './test_img/'
     test_folder = os.path.join(path, dataset_name)
     test_out_folder = os.path.join(r'./test_result', dataset_name)
@@ -54,9 +51,6 @@ for dataset_name in ["MSRS"]:
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     encoder = nn.DataParallel(SharedEncoder(inp_channels=1, feature_dim=64)).to(device)
-    decoder = nn.DataParallel(FusionDecoder(channels=64, out_channels=1)).to(device)
-    base_fusion = nn.DataParallel(BaseFusion(channels=64)).to(device)
-    spatial_compensation = nn.DataParallel(SpatialResidualCompensation(channels=64, init_scale=0.1)).to(device)
     frequency_fusion = nn.DataParallel(
         HighLevelGuidedFrequencyFusion(
             in_channels=64,
@@ -65,25 +59,26 @@ for dataset_name in ["MSRS"]:
             phase_topk_ratio=0.35,
             token_embed_dim=128,
             num_heads=4,
+            return_aux=True,
+            routing_temperature=0.25,
             use_real_clip_prompt_bank=USE_REAL_CLIP_PROMPT_BANK,
             clip_model_name=CLIP_MODEL_NAME,
             prompt_texts=PROMPT_TEXTS,
             clip_download_root=CLIP_DOWNLOAD_ROOT,
         )
     ).to(device)
+    spatial_fusion = nn.DataParallel(
+        TextConditionedSpatialFusion(channels=64, intent_dim=64, num_heads=4, use_freq_context=True)
+    ).to(device)
+    decoder = nn.DataParallel(FusionDecoder(channels=64, out_channels=1)).to(device)
 
     checkpoint = torch.load(ckpt_path, map_location=device)
     _load_state(encoder, checkpoint, 'shared_encoder', 'DIDF_Encoder')
+    _load_state(frequency_fusion, checkpoint, 'frequency_fusion', 'DetailFuseLayer', strict=False)
+    _load_state(spatial_fusion, checkpoint, 'spatial_fusion', 'spatial_compensation', strict=False)
     _load_state(decoder, checkpoint, 'fusion_decoder', 'DIDF_Decoder')
-    _load_state(base_fusion, checkpoint, 'base_fusion', 'BaseFuseLayer')
-    _load_state(frequency_fusion, checkpoint, 'frequency_fusion', 'DetailFuseLayer')
-    loaded_compensation = _load_state(spatial_compensation, checkpoint, 'spatial_compensation', 'SpatialCompensation', strict=False)
-    if not loaded_compensation:
-        print('[Warning] checkpoint does not contain spatial_compensation; compensation is disabled by setting comp_scale=0.0.')
-        comp_module = spatial_compensation.module if hasattr(spatial_compensation, 'module') else spatial_compensation
-        comp_module.comp_scale.data.zero_()
 
-    encoder.eval(); decoder.eval(); base_fusion.eval(); frequency_fusion.eval(); spatial_compensation.eval()
+    encoder.eval(); frequency_fusion.eval(); spatial_fusion.eval(); decoder.eval()
     with torch.no_grad():
         for img_name in os.listdir(os.path.join(test_folder, 'ir')):
             data_ir = image_read_cv2(os.path.join(test_folder, 'ir', img_name), mode='GRAY')[np.newaxis, np.newaxis, ...] / 255.0
@@ -93,13 +88,12 @@ for dataset_name in ["MSRS"]:
             data_ir = torch.FloatTensor(data_ir).to(device)
             data_vis = torch.FloatTensor(data_vis).to(device)
 
-            vis_base, vis_freq, _ = encoder(data_vis)
-            ir_base, ir_freq, _ = encoder(data_ir)
-            fused_base_init = base_fusion(vis_base, ir_base)
-            fused_freq = frequency_fusion(vis_freq, ir_freq)
-            fused_base = spatial_compensation(fused_base_init, fused_freq, vis_base, ir_base)
+            vis_spa, vis_freq, _ = encoder(data_vis)
+            ir_spa, ir_freq, _ = encoder(data_ir)
+            fused_freq, freq_aux = frequency_fusion(vis_freq, ir_freq)
+            fused_spa = spatial_fusion(vis_spa, ir_spa, freq_aux['spatial_intent'], fused_freq)
             decoder_skip = 0.5 * (data_vis + data_ir)
-            data_fuse, _ = decoder(decoder_skip, fused_base, fused_freq)
+            data_fuse, _ = decoder(decoder_skip, fused_spa, fused_freq)
             data_fuse = (data_fuse - torch.min(data_fuse)) / (torch.max(data_fuse) - torch.min(data_fuse) + 1e-8)
             fi = np.squeeze((data_fuse * 255).cpu().numpy()).astype(np.uint8)
             ycrcb_fi = np.dstack((fi, data_vis_cr, data_vis_cb))

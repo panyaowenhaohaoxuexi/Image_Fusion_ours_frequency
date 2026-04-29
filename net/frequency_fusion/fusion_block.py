@@ -59,9 +59,23 @@ class HighLevelGuidedFrequencyFusion(nn.Module):
             num_prompts = len(prompt_texts)
         else:
             self.prompt_bank = FixedPromptBank(prior_dim=prior_dim)
-            num_prompts = 4
+            num_prompts = len(self.prompt_bank.prompt_names)
 
         self.intent_router = IntentRouter(in_channels=in_channels, prior_dim=prior_dim, num_prompts=num_prompts)
+
+        # 同一个 Text Intent Embedding 分成两个投影头：Frequency-Intent Head 和 Spatial-Intent Head。
+        self.frequency_intent_head = nn.Sequential(
+            nn.Linear(prior_dim, prior_dim),
+            nn.LayerNorm(prior_dim),
+            nn.GELU(),
+            nn.Linear(prior_dim, prior_dim),
+        )
+        self.spatial_intent_head = nn.Sequential(
+            nn.Linear(prior_dim, prior_dim),
+            nn.LayerNorm(prior_dim),
+            nn.GELU(),
+            nn.Linear(prior_dim, prior_dim),
+        )
 
         self.amp_score = TokenScoreNet(token_dim=token_dim, prior_dim=prior_dim, hidden_dim=token_embed_dim)
         self.phase_score = TokenScoreNet(token_dim=token_dim, prior_dim=prior_dim, hidden_dim=token_embed_dim)
@@ -155,23 +169,25 @@ class HighLevelGuidedFrequencyFusion(nn.Module):
 
     def forward(self, vis_feat: torch.Tensor, ir_feat: torch.Tensor):
         spatial_size = vis_feat.shape[-2:]
-        intent, prompt_weight = self.intent_router(vis_feat, ir_feat, self.prompt_bank())
+        text_intent, prompt_weight = self.intent_router(vis_feat, ir_feat, self.prompt_bank())
+        frequency_intent = self.frequency_intent_head(text_intent)
+        spatial_intent = self.spatial_intent_head(text_intent)
         vis_amp, vis_phase = split_amplitude_phase(vis_feat)
         ir_amp, ir_phase = split_amplitude_phase(ir_feat)
 
         fused_amp, amp_aux = self._fuse_branch(
-            vis_amp, ir_amp, intent, self.amp_score, self.amp_interaction,
+            vis_amp, ir_amp, frequency_intent, self.amp_score, self.amp_interaction,
             self.amp_bypass, self.amp_topk_ratio, branch_type='amp'
         )
         fused_phase, phase_aux = self._fuse_branch(
-            vis_phase, ir_phase, intent, self.phase_score, self.phase_interaction,
+            vis_phase, ir_phase, frequency_intent, self.phase_score, self.phase_interaction,
             self.phase_bypass, self.phase_topk_ratio, branch_type='phase'
         )
         fused_phase = phase_wrap(fused_phase)
         fused_spatial = rebuild_from_amplitude_phase(fused_amp, fused_phase, spatial_size)
         fused_feature = self.refine(fused_spatial)
 
-        gamma, beta = self.refine_affine(intent).chunk(2, dim=-1)
+        gamma, beta = self.refine_affine(frequency_intent).chunk(2, dim=-1)
         gamma = gamma.unsqueeze(-1).unsqueeze(-1)
         beta = beta.unsqueeze(-1).unsqueeze(-1)
         fused_feature = fused_feature * (1.0 + 0.1 * torch.tanh(gamma)) + 0.1 * beta
@@ -180,7 +196,9 @@ class HighLevelGuidedFrequencyFusion(nn.Module):
         if not self.return_aux:
             return fused_feature
         aux = {
-            'intent': intent,
+            'intent': text_intent,
+            'frequency_intent': frequency_intent,
+            'spatial_intent': spatial_intent,
             'prompt_weight': prompt_weight,
             'amp_score': amp_aux['score'],
             'phase_score': phase_aux['score'],

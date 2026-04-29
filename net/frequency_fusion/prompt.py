@@ -19,6 +19,7 @@ class FixedPromptBank(nn.Module):
             'structural_contours',
             'fine_textures',
             'balanced_fusion',
+            'low_light_enhancement',
         ]
         bank = torch.zeros(len(self.prompt_names), prior_dim, dtype=torch.float32)
         for i in range(len(self.prompt_names)):
