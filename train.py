@@ -57,7 +57,7 @@ def build_model(device: str):
             ffn_expansion_factor=2.0,
             init_res_scale=0.05,
             # 控制 freq_context是否进入空间域来调制
-            use_freq_context=True,
+            use_freq_context=False,
         )
     ).to(device)
 
