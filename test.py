@@ -7,8 +7,8 @@ import torch.nn as nn
 import warnings
 import logging
 
-from net.Network import SharedEncoder, FusionDecoder, TextConditionedSpatialFusion
-from net.frequency_fusion import HighLevelGuidedFrequencyFusion
+from net.Network import SharedEncoder, FusionDecoder, TextConditionedSpatialFusion, DualStreamIntentMLP, BFSC
+from net.frequency_fusion import TGSFF
 from utils.img_read_save import img_save, image_read_cv2
 
 warnings.filterwarnings('ignore')
@@ -17,32 +17,26 @@ logging.basicConfig(level=logging.CRITICAL)
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 ckpt_path = r'./models/TextIntentDualDomainFusion_latest.pth'
 
-USE_REAL_CLIP_PROMPT_BANK = True
-CLIP_MODEL_NAME = r'E:\yizuo_SCI\Code\Image_Fusion_ours_frequency\weight\clip\ViT-B-32.pt'
+CLIP_MODEL_NAME = r'E:\yizuo_SCI\1_Code\Image_Fusion_ours_frequency\weight\clip\ViT-B-32.pt'
 CLIP_DOWNLOAD_ROOT = r'E:\yizuo_SCI\weights\clip'
-PROMPT_TEXTS = [
-    'salient targets',
-    'structural contours',
-    'fine textures',
-    'balanced fusion',
-    'low light enhancement',
-]
 
 
 def build_model(device):
     encoder = nn.DataParallel(
-        SharedEncoder(
-            inp_channels=1,
-            feature_dim=64,
-            inner_dim=24,
-            num_blocks=1,
-            num_heads=1,
-            ffn_expansion_factor=2.0,
+        SharedEncoder(inp_channels=1, feature_dim=64, inner_dim=24, num_blocks=1, num_heads=1, ffn_expansion_factor=2.0)
+    ).to(device)
+    intent_generator = nn.DataParallel(
+        DualStreamIntentMLP(
+            channels=64,
+            intent_dim=64,
+            hidden_dim=256,
+            clip_model_name=CLIP_MODEL_NAME,
+            clip_download_root=CLIP_DOWNLOAD_ROOT,
+            use_clip_prompt_buffer=False,
         )
     ).to(device)
-
     frequency_fusion = nn.DataParallel(
-        HighLevelGuidedFrequencyFusion(
+        TGSFF(
             in_channels=64,
             patch_size=4,
             amp_topk_ratio=0.30,
@@ -51,13 +45,8 @@ def build_model(device):
             num_heads=4,
             return_aux=True,
             routing_temperature=0.25,
-            use_real_clip_prompt_bank=USE_REAL_CLIP_PROMPT_BANK,
-            clip_model_name=CLIP_MODEL_NAME,
-            prompt_texts=PROMPT_TEXTS,
-            clip_download_root=CLIP_DOWNLOAD_ROOT,
         )
     ).to(device)
-
     spatial_fusion = nn.DataParallel(
         TextConditionedSpatialFusion(
             channels=64,
@@ -68,18 +57,11 @@ def build_model(device):
             use_freq_context=False,
         )
     ).to(device)
-
+    bfsc = nn.DataParallel(BFSC(channels=64)).to(device)
     decoder = nn.DataParallel(
-        FusionDecoder(
-            channels=64,
-            out_channels=1,
-            inner_dim=24,
-            num_blocks=1,
-            num_heads=1,
-            ffn_expansion_factor=2.0,
-        )
+        FusionDecoder(channels=64, out_channels=1, inner_dim=24, num_blocks=1, num_heads=1, ffn_expansion_factor=2.0)
     ).to(device)
-    return encoder, frequency_fusion, spatial_fusion, decoder
+    return encoder, intent_generator, frequency_fusion, spatial_fusion, bfsc, decoder
 
 
 def _load_state(module, checkpoint, key, strict=True):
@@ -96,26 +78,25 @@ def normalize_to_uint8(tensor):
 
 def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    encoder, frequency_fusion, spatial_fusion, decoder = build_model(device)
+    encoder, intent_generator, frequency_fusion, spatial_fusion, bfsc, decoder = build_model(device)
 
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f'Checkpoint not found: {ckpt_path}')
     checkpoint = torch.load(ckpt_path, map_location=device)
     _load_state(encoder, checkpoint, 'shared_encoder', strict=True)
+    _load_state(intent_generator, checkpoint, 'intent_generator', strict=True)
     _load_state(frequency_fusion, checkpoint, 'frequency_fusion', strict=True)
     _load_state(spatial_fusion, checkpoint, 'spatial_fusion', strict=True)
+    _load_state(bfsc, checkpoint, 'bfsc', strict=True)
     _load_state(decoder, checkpoint, 'fusion_decoder', strict=True)
 
-    encoder.eval()
-    frequency_fusion.eval()
-    spatial_fusion.eval()
-    decoder.eval()
+    for module in [encoder, intent_generator, frequency_fusion, spatial_fusion, bfsc, decoder]:
+        module.eval()
 
     for dataset_name in ['MSRS']:
         print('\n' * 2 + '=' * 80)
         print('The test result of ' + dataset_name + ' :')
-        path = './test_img/'
-        test_folder = os.path.join(path, dataset_name)
+        test_folder = os.path.join('./test_img/', dataset_name)
         test_out_folder = os.path.join(r'./test_result', dataset_name)
         os.makedirs(test_out_folder, exist_ok=True)
 
@@ -147,16 +128,15 @@ def main():
 
                 vis_spa, vis_freq, _ = encoder(data_vis)
                 ir_spa, ir_freq, _ = encoder(data_ir)
-
-                # 单层频率域：vis_freq / ir_freq 均为 Tensor，不再是多尺度 list。
-                fused_freq, freq_aux = frequency_fusion(vis_freq, ir_freq)
-                spatial_intent = freq_aux['spatial_intent']
-
-                # 不传入 fused_freq 或 freq_context，保持频率域与空间域并行。
-                fused_spa = spatial_fusion(vis_spa, ir_spa, spatial_intent)
+                z_deg, z_fus = intent_generator(vis_spa, ir_spa, vis_freq, ir_freq)
+                fused_freq, _ = frequency_fusion(vis_freq, ir_freq, frequency_intent=z_deg)
+                fused_spa_coarse, _ = spatial_fusion(vis_spa, ir_spa, z_fus, coarse_only=True, return_aux=True)
+                _, g_coarse = bfsc(fused_freq, fused_spa_coarse)
+                fused_spa, _ = spatial_fusion(vis_spa, ir_spa, z_fus, feedback_gate=g_coarse, return_aux=True)
+                dual_feature, _ = bfsc(fused_freq, fused_spa)
 
                 decoder_skip = 0.5 * (data_vis + data_ir)
-                data_fuse, _ = decoder(decoder_skip, fused_spa, fused_freq, text_intent=spatial_intent)
+                data_fuse, _ = decoder(decoder_skip, dual_feature, fused_freq, text_intent=z_fus)
 
                 fi = normalize_to_uint8(data_fuse)
                 ycrcb_fi = np.dstack((fi, data_vis_cr, data_vis_cb))

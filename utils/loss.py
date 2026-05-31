@@ -3,6 +3,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    import clip  # type: ignore
+except Exception:
+    clip = None
+
 
 class Sobelxy(nn.Module):
     def __init__(self):
@@ -195,3 +200,66 @@ class TokenRoutingRankingLoss(nn.Module):
             'phase_unselected_score_mean': phase_unsel,
         }
         return total, log
+
+
+class IntentAlignmentLoss(nn.Module):
+    """Contrastively align free intent vectors to fixed prompt anchors."""
+
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def _loss_one(self, z: torch.Tensor, prompt_bank: torch.Tensor) -> torch.Tensor:
+        z = F.normalize(z, dim=-1)
+        prompt_bank = F.normalize(prompt_bank.detach().to(z.device, z.dtype), dim=-1)
+        logits = z.matmul(prompt_bank.t()) / max(float(self.temperature), 1e-6)
+        target = torch.argmax(logits.detach(), dim=1)
+        return F.cross_entropy(logits, target)
+
+    def forward(self, z_deg: torch.Tensor, z_fus: torch.Tensor,
+                degradation_prompt_bank: torch.Tensor, fusion_prompt_bank: torch.Tensor):
+        deg_loss = self._loss_one(z_deg, degradation_prompt_bank)
+        fus_loss = self._loss_one(z_fus, fusion_prompt_bank)
+        total = deg_loss + fus_loss
+        return total, {'align_deg': deg_loss.detach(), 'align_fus': fus_loss.detach()}
+
+
+class CLIPSemanticConsistencyLoss(nn.Module):
+    """Frozen CLIP image-feature consistency for VIS/IR/Fused grayscale tensors."""
+
+    def __init__(self, clip_model_name: str = 'ViT-B/32', download_root: str = None,
+                 image_size: int = 224):
+        super().__init__()
+        if clip is None:
+            raise ImportError('openai-clip is required for CLIPSemanticConsistencyLoss.')
+        clip_model, _ = clip.load(clip_model_name, device='cpu', download_root=download_root)
+        clip_model.eval()
+        for p in clip_model.parameters():
+            p.requires_grad = False
+        self.clip_model = clip_model
+        self.image_size = image_size
+        self.register_buffer('mean', torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1))
+
+    def _prep(self, x: torch.Tensor) -> torch.Tensor:
+        x = x[:, :1].clamp(0.0, 1.0).repeat(1, 3, 1, 1)
+        x = F.interpolate(x, size=(self.image_size, self.image_size), mode='bilinear', align_corners=False)
+        mean = self.mean.to(device=x.device, dtype=x.dtype)
+        std = self.std.to(device=x.device, dtype=x.dtype)
+        return (x - mean) / std
+
+    def _encode(self, x: torch.Tensor) -> torch.Tensor:
+        image = self._prep(x)
+        dtype = next(self.clip_model.parameters()).dtype
+        feat = self.clip_model.encode_image(image.to(dtype=dtype))
+        return F.normalize(feat.float(), dim=-1)
+
+    def forward(self, image_vis: torch.Tensor, image_ir: torch.Tensor, fused: torch.Tensor):
+        fused_feat = self._encode(fused)
+        with torch.no_grad():
+            vis_feat = self._encode(image_vis)
+            ir_feat = self._encode(image_ir)
+        loss_vis = 1.0 - F.cosine_similarity(fused_feat, vis_feat, dim=-1).mean()
+        loss_ir = 1.0 - F.cosine_similarity(fused_feat, ir_feat, dim=-1).mean()
+        total = 0.5 * (loss_vis + loss_ir)
+        return total, {'sem_vis': loss_vis.detach(), 'sem_ir': loss_ir.detach()}

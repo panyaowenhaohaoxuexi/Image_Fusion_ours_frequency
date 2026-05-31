@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
-"""频率域融合模块包。"""
-from .fusion_block import HighLevelGuidedFrequencyFusion
-__all__ = ["HighLevelGuidedFrequencyFusion"]
+"""Frequency-domain fusion package."""
+from .fusion_block import TGSFF, HighLevelGuidedFrequencyFusion
+
+__all__ = ["TGSFF", "HighLevelGuidedFrequencyFusion"]
