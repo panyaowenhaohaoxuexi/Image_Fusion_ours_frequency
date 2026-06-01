@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from net.encoder.blocks import ConvBNAct, ResidualBlock
+from net.encoder.blocks import ResidualBlock
 from net.restormer_light import TransformerBlock
 
 TensorOrPyramid = Union[torch.Tensor, Sequence[torch.Tensor]]
@@ -18,83 +18,132 @@ def _valid_heads(channels: int, requested: int) -> int:
     return heads
 
 
-class SpatialAlphaFusionBlock(nn.Module):
-    """Position-adaptive spatial fusion: alpha * visible + (1-alpha) * infrared."""
+class SemanticAffineModulation(nn.Module):
+    """Modality-specific IN + affine modulation generated from z_fus."""
 
-    def __init__(self, channels: int = 64, intent_dim: int = 64, use_feedback: bool = True):
+    def __init__(self, channels: int = 64, intent_dim: int = 64):
         super().__init__()
-        self.use_feedback = use_feedback
-        in_channels = channels * 3 + intent_dim + (1 if use_feedback else 0)
-        self.intent_proj = nn.Linear(intent_dim, intent_dim)
-        self.alpha_net = nn.Sequential(
-            nn.Conv2d(in_channels, channels, 3, 1, 1),
+        self.norm = nn.InstanceNorm2d(channels, affine=False, track_running_stats=False)
+        self.mlp = nn.Sequential(
+            nn.Linear(intent_dim, channels * 2),
+            nn.LayerNorm(channels * 2),
             nn.GELU(),
-            nn.Conv2d(channels, channels // 2, 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(channels // 2, 1, 1, 1, 0),
-            nn.Sigmoid(),
+            nn.Linear(channels * 2, channels * 2),
         )
-        self.refine = nn.Sequential(ConvBNAct(channels, channels, 3, 1, 1, 'gelu'), ResidualBlock(channels))
+        self.gamma_proj = nn.Conv2d(channels, channels, 1, 1, 0)
+        self.beta_proj = nn.Conv2d(channels, channels, 1, 1, 0)
 
-    def forward(self, vis_feat: torch.Tensor, ir_feat: torch.Tensor,
-                spatial_intent: torch.Tensor, feedback_gate: Optional[torch.Tensor] = None):
-        b, _, h, w = vis_feat.shape
-        intent_map = self.intent_proj(spatial_intent).view(b, -1, 1, 1).expand(-1, -1, h, w)
-        context = [vis_feat, ir_feat, torch.abs(vis_feat - ir_feat), intent_map]
-        if self.use_feedback:
-            if feedback_gate is None:
-                feedback_gate = torch.zeros(b, 1, h, w, device=vis_feat.device, dtype=vis_feat.dtype)
-            elif feedback_gate.shape[-2:] != (h, w):
-                feedback_gate = F.interpolate(feedback_gate, size=(h, w), mode='bilinear', align_corners=False)
-            context.append(feedback_gate)
-        alpha = self.alpha_net(torch.cat(context, dim=1))
-        fused = alpha * vis_feat + (1.0 - alpha) * ir_feat
-        fused = self.refine(fused) + fused
-        return fused, alpha
+    def forward(self, feat: torch.Tensor, z_fus: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = feat.shape
+        gamma, beta = self.mlp(z_fus).chunk(2, dim=1)
+        gamma = gamma.view(b, c, 1, 1).expand(-1, -1, h, w)
+        beta = beta.view(b, c, 1, 1).expand(-1, -1, h, w)
+        gamma = self.gamma_proj(gamma)
+        beta = self.beta_proj(beta)
+        return gamma * self.norm(feat) + beta
 
 
-class FeedbackTopDownBlock(nn.Module):
-    """Top-down aggregation conditioned by BFSC feedback gate."""
+class ShallowSemanticFusionBlock(nn.Module):
+    """L1/L2: semantic modulation followed by lightweight feature fusion."""
 
-    def __init__(self, channels: int = 64, num_heads: int = 1, ffn_expansion_factor: float = 2.0):
+    def __init__(self, channels: int = 64, intent_dim: int = 64):
         super().__init__()
-        self.fuse = nn.Conv2d(channels * 2 + 1, channels, 1, 1, 0, bias=False)
-        self.refine = nn.Sequential(
-            TransformerBlock(channels, _valid_heads(channels, num_heads), ffn_expansion_factor, False, 'WithBias'),
-            ConvBNAct(channels, channels, 3, 1, 1, 'gelu'),
+        self.vis_mod = SemanticAffineModulation(channels, intent_dim)
+        self.ir_mod = SemanticAffineModulation(channels, intent_dim)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 3, 1, 1),
+            nn.GELU(),
             ResidualBlock(channels),
         )
 
-    def forward(self, high_feat: torch.Tensor, skip_feat: torch.Tensor,
+    def forward(self, vis_feat: torch.Tensor, ir_feat: torch.Tensor, z_fus: torch.Tensor):
+        vis_tilde = self.vis_mod(vis_feat, z_fus)
+        ir_tilde = self.ir_mod(ir_feat, z_fus)
+        fused = self.fuse(torch.cat([vis_tilde, ir_tilde], dim=1))
+        return fused, {'vis_tilde': vis_tilde, 'ir_tilde': ir_tilde}
+
+
+class DeepSemanticCrossModalFusionBlock(nn.Module):
+    """L3: semantic modulation, bidirectional cross-attention, and context refinement."""
+
+    def __init__(self, channels: int = 64, intent_dim: int = 64, num_heads: int = 1,
+                 ffn_expansion_factor: float = 2.0):
+        super().__init__()
+        heads = _valid_heads(channels, num_heads)
+        self.vis_mod = SemanticAffineModulation(channels, intent_dim)
+        self.ir_mod = SemanticAffineModulation(channels, intent_dim)
+        self.vis_to_ir = nn.MultiheadAttention(channels, heads)
+        self.ir_to_vis = nn.MultiheadAttention(channels, heads)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 3, 1, 1),
+            nn.GELU(),
+        )
+        self.context = TransformerBlock(channels, heads, ffn_expansion_factor, False, 'WithBias')
+        self.residual = ResidualBlock(channels)
+
+    @staticmethod
+    def _to_tokens(x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        return x.permute(0, 2, 3, 1).contiguous().view(b, h * w, c)
+
+    @staticmethod
+    def _to_map(x: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        b, _, c = x.shape
+        return x.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
+
+    def forward(self, vis_feat: torch.Tensor, ir_feat: torch.Tensor, z_fus: torch.Tensor,
                 feedback_gate: Optional[torch.Tensor] = None):
+        _, _, h, w = vis_feat.shape
+        vis_tilde = self.vis_mod(vis_feat, z_fus)
+        ir_tilde = self.ir_mod(ir_feat, z_fus)
+        vis_tokens = self._to_tokens(vis_tilde)
+        ir_tokens = self._to_tokens(ir_tilde)
+        vis_update_t, _ = self.vis_to_ir(
+            vis_tokens.transpose(0, 1), ir_tokens.transpose(0, 1), ir_tokens.transpose(0, 1)
+        )
+        ir_update_t, _ = self.ir_to_vis(
+            ir_tokens.transpose(0, 1), vis_tokens.transpose(0, 1), vis_tokens.transpose(0, 1)
+        )
+        vis_update = vis_update_t.transpose(0, 1)
+        ir_update = ir_update_t.transpose(0, 1)
+        vis_hat = self._to_map(vis_tokens + vis_update, h, w)
+        ir_hat = self._to_map(ir_tokens + ir_update, h, w)
+        fused = self.fuse(torch.cat([vis_hat, ir_hat], dim=1))
+        if feedback_gate is not None:
+            if feedback_gate.shape[-2:] != (h, w):
+                feedback_gate = F.interpolate(feedback_gate, size=(h, w), mode='bilinear', align_corners=False)
+            fused = fused * (1.0 + feedback_gate)
+        fused = self.context(fused)
+        fused = self.residual(fused) + fused
+        return fused, {'vis_tilde': vis_tilde, 'ir_tilde': ir_tilde, 'vis_hat': vis_hat, 'ir_hat': ir_hat}
+
+
+class TopDownSemanticBlock(nn.Module):
+    def __init__(self, channels: int = 64, num_heads: int = 1, ffn_expansion_factor: float = 2.0):
+        super().__init__()
+        heads = _valid_heads(channels, num_heads)
+        self.fuse = nn.Conv2d(channels * 2, channels, 1, 1, 0)
+        self.refine = TransformerBlock(channels, heads, ffn_expansion_factor, False, 'WithBias')
+
+    def forward(self, high_feat: torch.Tensor, skip_feat: torch.Tensor) -> torch.Tensor:
         high_up = F.interpolate(high_feat, size=skip_feat.shape[-2:], mode='bilinear', align_corners=False)
-        if feedback_gate is None:
-            feedback_gate = torch.zeros(skip_feat.shape[0], 1, skip_feat.shape[-2], skip_feat.shape[-1],
-                                        device=skip_feat.device, dtype=skip_feat.dtype)
-        elif feedback_gate.shape[-2:] != skip_feat.shape[-2:]:
-            feedback_gate = F.interpolate(feedback_gate, size=skip_feat.shape[-2:], mode='bilinear', align_corners=False)
-        x = self.fuse(torch.cat([high_up, skip_feat, feedback_gate], dim=1))
-        return self.refine(x) + x
+        return self.refine(self.fuse(torch.cat([high_up, skip_feat], dim=1)))
 
 
 class TGCSF(nn.Module):
-    """Text-guided cross-modal spatial fusion with position-adaptive alpha maps."""
+    """Three-level semantically parameterized cross-modal spatial fusion."""
 
     def __init__(self, channels: int = 64, intent_dim: int = 64, num_heads: int = 1,
                  ffn_expansion_factor: float = 2.0, init_res_scale: float = 0.20,
                  use_freq_context: bool = True, max_attn_size: int = 32,
                  norm_groups: int = 16):
         super().__init__()
-        self.level1_alpha = SpatialAlphaFusionBlock(channels, intent_dim, use_feedback=True)
-        self.level2_alpha = SpatialAlphaFusionBlock(channels, intent_dim, use_feedback=True)
-        self.level3_alpha = SpatialAlphaFusionBlock(channels, intent_dim, use_feedback=True)
-        self.coarse_refine = nn.Sequential(ConvBNAct(channels, channels, 3, 1, 1, 'gelu'), ResidualBlock(channels))
-        self.topdown_l2 = FeedbackTopDownBlock(channels, num_heads, ffn_expansion_factor)
-        self.topdown_l1 = FeedbackTopDownBlock(channels, num_heads, ffn_expansion_factor)
-        self.final_refine = nn.Sequential(
-            TransformerBlock(channels, _valid_heads(channels, num_heads), ffn_expansion_factor, False, 'WithBias'),
-            nn.Conv2d(channels, channels, 3, 1, 1, bias=False),
-        )
+        self.level1 = ShallowSemanticFusionBlock(channels, intent_dim)
+        self.level2 = ShallowSemanticFusionBlock(channels, intent_dim)
+        self.level3 = DeepSemanticCrossModalFusionBlock(channels, intent_dim, num_heads, ffn_expansion_factor)
+        self.topdown_l2 = TopDownSemanticBlock(channels, num_heads, ffn_expansion_factor)
+        self.topdown_l1 = TopDownSemanticBlock(channels, num_heads, ffn_expansion_factor)
+        self.final_refine = TransformerBlock(channels, _valid_heads(channels, num_heads), ffn_expansion_factor, False, 'WithBias')
         self.out_norm = nn.BatchNorm2d(channels)
         self.res_scale = nn.Parameter(torch.tensor(float(init_res_scale)))
 
@@ -115,34 +164,38 @@ class TGCSF(nn.Module):
         vis_l1, vis_l2, vis_l3 = self._as_three_levels(vis_spa)
         ir_l1, ir_l2, ir_l3 = self._as_three_levels(ir_spa)
 
+        fused_l3, aux_l3 = self.level3(vis_l3, ir_l3, spatial_intent, feedback_gate)
         if coarse_only:
-            fused_l3, alpha_l3 = self.level3_alpha(vis_l3, ir_l3, spatial_intent, feedback_gate=None)
-            coarse = self.coarse_refine(fused_l3) + fused_l3
-            coarse = F.interpolate(coarse, size=vis_l1.shape[-2:], mode='bilinear', align_corners=False)
+            coarse = F.interpolate(fused_l3, size=vis_l1.shape[-2:], mode='bilinear', align_corners=False)
             if not return_aux:
                 return coarse
-            return coarse, {'coarse_l3': fused_l3, 'alpha_l3': alpha_l3}
+            return coarse, {
+                'fused_l1': coarse,
+                'fused_l2': F.interpolate(fused_l3, size=vis_l2.shape[-2:], mode='bilinear', align_corners=False),
+                'fused_l3': fused_l3,
+                'td_l2': F.interpolate(fused_l3, size=vis_l2.shape[-2:], mode='bilinear', align_corners=False),
+                'td_l1': coarse,
+                'l3_aux': aux_l3,
+            }
 
-        fused_l1, alpha_l1 = self.level1_alpha(vis_l1, ir_l1, spatial_intent, feedback_gate)
-        fused_l2, alpha_l2 = self.level2_alpha(vis_l2, ir_l2, spatial_intent, feedback_gate)
-        fused_l3, alpha_l3 = self.level3_alpha(vis_l3, ir_l3, spatial_intent, feedback_gate)
-        td_l2 = self.topdown_l2(fused_l3, fused_l2, feedback_gate)
-        td_l1 = self.topdown_l1(td_l2, fused_l1, feedback_gate)
+        fused_l1, aux_l1 = self.level1(vis_l1, ir_l1, spatial_intent)
+        fused_l2, aux_l2 = self.level2(vis_l2, ir_l2, spatial_intent)
+        td_l2 = self.topdown_l2(fused_l3, fused_l2)
+        td_l1 = self.topdown_l1(td_l2, fused_l1)
         refined = self.final_refine(td_l1)
         out = self.out_norm(td_l1 + self.res_scale * refined)
 
         if not return_aux:
             return out
         aux: Dict[str, torch.Tensor] = {
-            'l1_fused': fused_l1,
-            'l2_fused': fused_l2,
-            'l3_fused': fused_l3,
+            'fused_l1': fused_l1,
+            'fused_l2': fused_l2,
+            'fused_l3': fused_l3,
             'td_l2': td_l2,
             'td_l1': td_l1,
-            'alpha_l1': alpha_l1,
-            'alpha_l2': alpha_l2,
-            'alpha_l3': alpha_l3,
-            'feedback_gate': feedback_gate if feedback_gate is not None else torch.zeros_like(alpha_l1),
+            'l1_aux': aux_l1,
+            'l2_aux': aux_l2,
+            'l3_aux': aux_l3,
             'spatial_res_scale': self.res_scale.detach(),
         }
         return out, aux

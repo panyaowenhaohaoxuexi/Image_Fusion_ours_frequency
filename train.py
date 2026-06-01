@@ -22,7 +22,7 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 CLIP_MODEL_NAME = r'E:\yizuo_SCI\1_Code\Image_Fusion_ours_frequency\weight\clip\ViT-B-32.pt'
-CLIP_DOWNLOAD_ROOT = r'E:\yizuo_SCI\weights\clip'
+CLIP_DOWNLOAD_ROOT = r'E:\yizuo_SCI\1_Code\Image_Fusion_ours_frequency\weight\clip'
 
 
 def build_model(device: str):
