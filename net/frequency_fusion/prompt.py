@@ -31,6 +31,18 @@ class FixedPromptBank(nn.Module):
         return self.prompt_bank
 
 
+class LearnablePromptBank(nn.Module):
+    """Ablation-only prompt bank with learnable vectors."""
+
+    def __init__(self, num_prompts: int, prior_dim: int = 64):
+        super().__init__()
+        prompt_bank = torch.randn(num_prompts, prior_dim, dtype=torch.float32) * (prior_dim ** -0.5)
+        self.prompt_bank = nn.Parameter(F.normalize(prompt_bank, dim=-1))
+
+    def forward(self) -> torch.Tensor:
+        return F.normalize(self.prompt_bank, dim=-1)
+
+
 class CLIPTextPromptBank(nn.Module):
     """冻结 CLIP text encoder，将固定 prompt 编码成可训练投影后的语义先验。"""
 
@@ -39,9 +51,10 @@ class CLIPTextPromptBank(nn.Module):
                  clip_model_name: str = 'ViT-B/32',
                  prompt_texts=None,
                  download_root: str = None,
-                 clip_device: str = None):
+                 clip_device: str = None,
+                 allow_deterministic_fallback: bool = False):
         super().__init__()
-        if clip is None:
+        if clip is None and not allow_deterministic_fallback:
             raise ImportError(
                 '未检测到 clip 库。请先安装 openai-clip，例如: pip install openai-clip==1.0.1'
             )
@@ -56,6 +69,12 @@ class CLIPTextPromptBank(nn.Module):
             ]
         self.prompt_texts = list(prompt_texts)
         self.prompt_names = list(prompt_texts)
+
+        if clip is None or allow_deterministic_fallback:
+            bank = self._deterministic_bank(len(self.prompt_texts), prior_dim)
+            self.register_buffer('fallback_prompt_bank', bank)
+            self.proj = None
+            return
 
         if clip_device is None:
             clip_device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -79,7 +98,16 @@ class CLIPTextPromptBank(nn.Module):
             nn.LayerNorm(prior_dim),
         )
 
+    @staticmethod
+    def _deterministic_bank(num_prompts: int, prior_dim: int) -> torch.Tensor:
+        bank = torch.zeros(num_prompts, prior_dim, dtype=torch.float32)
+        for i in range(num_prompts):
+            bank[i, i::num_prompts] = 1.0
+        return F.normalize(bank, dim=-1)
+
     def forward(self) -> torch.Tensor:
+        if self.proj is None:
+            return self.fallback_prompt_bank
         clip_text_features = self.clip_text_features.to(self.proj[0].weight.device)
         prompt_bank = self.proj(clip_text_features)
         prompt_bank = F.normalize(prompt_bank, dim=-1)

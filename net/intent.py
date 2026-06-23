@@ -5,26 +5,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    import clip  # type: ignore
-except Exception:
-    clip = None
+from net.frequency_fusion.prompt import CLIPTextPromptBank, LearnablePromptBank
 
 TensorOrPyramid = Union[torch.Tensor, Sequence[torch.Tensor]]
 
 
 DEGRADATION_PROMPTS = [
-    "handle nighttime low light",
-    "handle visible blur",
-    "handle exposure anomaly",
-    "handle infrared noise",
-    "handle infrared low contrast",
+    "low light enhancement",
+    "visible blur suppression",
+    "exposure anomaly correction",
+    "infrared noise suppression",
+    "infrared low contrast enhancement",
+    "structural contours restoration",
 ]
 
 FUSION_PROMPTS = [
-    "preserve edge structure",
-    "preserve visible texture",
-    "natural overall appearance",
+    "salient infrared targets",
+    "visible fine textures",
+    "edge structure preservation",
+    "natural scene appearance",
+    "balanced infrared visible fusion",
+    "local contrast preservation",
 ]
 
 
@@ -39,81 +40,96 @@ def _as_three_levels(x: TensorOrPyramid) -> Tuple[torch.Tensor, torch.Tensor, to
     return l1, l2, l3
 
 
-class DualStreamIntentMLP(nn.Module):
-    """Generate free continuous degradation/fusion intents from spatial and frequency features.
+class DualDomainTextIntentGenerator(nn.Module):
+    """Generate dual intents by image-driven weighting over two text prompt banks.
 
-    CLIP text prompts are stored only as detached semantic anchors for the alignment loss;
-    they are not used to synthesize z_deg or z_fus.
+    Image features only produce prompt logits. The semantic content of I_deg and
+    I_fus is exactly the convex combination of their respective prompt banks.
     """
 
     def __init__(self, channels: int = 64, intent_dim: int = 64, hidden_dim: int = 256,
                  clip_model_name: str = "ViT-B/32", clip_download_root: str = None,
-                 use_clip_prompt_buffer: bool = True):
+                 clip_device: str = None, use_clip_prompt_bank: bool = True,
+                 use_learnable_prompt_embedding: bool = False):
         super().__init__()
-        in_dim = channels * 8  # vis/ir spatial L1-L3 plus vis/ir frequency.
-        self.deg_mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, intent_dim),
-        )
-        self.fus_mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, intent_dim),
-        )
-        deg_prompt, fus_prompt = self._build_prompt_buffers(
-            intent_dim, clip_model_name, clip_download_root, use_clip_prompt_buffer
-        )
-        self.register_buffer("degradation_prompt_bank", deg_prompt)
-        self.register_buffer("fusion_prompt_bank", fus_prompt)
+        self.intent_dim = intent_dim
+        self.use_learnable_prompt_embedding = use_learnable_prompt_embedding
+        if use_learnable_prompt_embedding:
+            self.deg_prompt_bank = LearnablePromptBank(len(DEGRADATION_PROMPTS), intent_dim)
+            self.fus_prompt_bank = LearnablePromptBank(len(FUSION_PROMPTS), intent_dim)
+        else:
+            self.deg_prompt_bank = CLIPTextPromptBank(
+                prior_dim=intent_dim,
+                clip_model_name=clip_model_name,
+                prompt_texts=DEGRADATION_PROMPTS,
+                download_root=clip_download_root,
+                clip_device=clip_device,
+                allow_deterministic_fallback=not use_clip_prompt_bank,
+            )
+            self.fus_prompt_bank = CLIPTextPromptBank(
+                prior_dim=intent_dim,
+                clip_model_name=clip_model_name,
+                prompt_texts=FUSION_PROMPTS,
+                download_root=clip_download_root,
+                clip_device=clip_device,
+                allow_deterministic_fallback=not use_clip_prompt_bank,
+            )
+
+        query_dim = channels * 8
+        self.deg_weighting_head = self._make_weighting_head(query_dim, hidden_dim, len(DEGRADATION_PROMPTS))
+        self.fus_weighting_head = self._make_weighting_head(query_dim, hidden_dim, len(FUSION_PROMPTS))
 
     @staticmethod
-    def _one_hot_bank(num_prompts: int, intent_dim: int) -> torch.Tensor:
-        bank = torch.zeros(num_prompts, intent_dim, dtype=torch.float32)
-        for i in range(num_prompts):
-            bank[i, i::num_prompts] = 1.0
-        return F.normalize(bank, dim=-1)
-
-    @classmethod
-    def _build_prompt_buffers(cls, intent_dim: int, clip_model_name: str,
-                              clip_download_root: str, use_clip_prompt_buffer: bool):
-        if not use_clip_prompt_buffer or clip is None:
-            return cls._one_hot_bank(len(DEGRADATION_PROMPTS), intent_dim), cls._one_hot_bank(len(FUSION_PROMPTS), intent_dim)
-
-        device = "cpu"
-        clip_model, _ = clip.load(clip_model_name, device=device, download_root=clip_download_root)
-        clip_model.eval()
-        for p in clip_model.parameters():
-            p.requires_grad = False
-        with torch.no_grad():
-            prompts = DEGRADATION_PROMPTS + FUSION_PROMPTS
-            tokens = clip.tokenize(prompts).to(device)
-            text_features = clip_model.encode_text(tokens).float()
-            text_features = F.normalize(text_features, dim=-1)
-        clip_dim = text_features.shape[-1]
-        # Deterministic fixed random projection avoids training the semantic anchors.
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(20260531)
-        proj = torch.randn(clip_dim, intent_dim, generator=generator) / (clip_dim ** 0.5)
-        prompt_bank = F.normalize(text_features.cpu().matmul(proj), dim=-1)
-        return prompt_bank[:len(DEGRADATION_PROMPTS)], prompt_bank[len(DEGRADATION_PROMPTS):]
+    def _make_weighting_head(in_dim: int, hidden_dim: int, out_dim: int) -> nn.Module:
+        return nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
 
     @staticmethod
     def _pool(x: torch.Tensor) -> torch.Tensor:
         return F.adaptive_avg_pool2d(x, 1).flatten(1)
 
-    def forward(self, vis_spa: TensorOrPyramid, ir_spa: TensorOrPyramid,
-                vis_freq: torch.Tensor, ir_freq: torch.Tensor):
+    def _build_image_query(self, vis_spa: TensorOrPyramid, ir_spa: TensorOrPyramid,
+                           vis_freq: torch.Tensor, ir_freq: torch.Tensor) -> torch.Tensor:
         vis_l1, vis_l2, vis_l3 = _as_three_levels(vis_spa)
         ir_l1, ir_l2, ir_l3 = _as_three_levels(ir_spa)
-        q = torch.cat([
+        return torch.cat([
             self._pool(vis_l1), self._pool(ir_l1),
             self._pool(vis_l2), self._pool(ir_l2),
             self._pool(vis_l3), self._pool(ir_l3),
             self._pool(vis_freq), self._pool(ir_freq),
         ], dim=1)
-        z_deg = self.deg_mlp(q)
-        z_fus = self.fus_mlp(q)
-        return z_deg, z_fus
+
+    def forward(self, vis_spa: TensorOrPyramid, ir_spa: TensorOrPyramid,
+                vis_freq: torch.Tensor, ir_freq: torch.Tensor):
+        image_query = self._build_image_query(vis_spa, ir_spa, vis_freq, ir_freq)
+        deg_logits = self.deg_weighting_head(image_query)
+        fus_logits = self.fus_weighting_head(image_query)
+        deg_prompt_weight = torch.softmax(deg_logits, dim=-1)
+        fus_prompt_weight = torch.softmax(fus_logits, dim=-1)
+        deg_bank = self.deg_prompt_bank().to(device=image_query.device, dtype=image_query.dtype)
+        fus_bank = self.fus_prompt_bank().to(device=image_query.device, dtype=image_query.dtype)
+        I_deg = deg_prompt_weight.matmul(deg_bank)
+        I_fus = fus_prompt_weight.matmul(fus_bank)
+        aux = {
+            "deg_prompt_weight": deg_prompt_weight,
+            "fus_prompt_weight": fus_prompt_weight,
+            "deg_prompt_bank": deg_bank,
+            "fus_prompt_bank": fus_bank,
+            "deg_prompt_logits": deg_logits,
+            "fus_prompt_logits": fus_logits,
+        }
+        return I_deg, I_fus, aux
+
+
+class DualStreamIntentMLP(DualDomainTextIntentGenerator):
+    """Historical compatibility alias.
+
+    New training and inference code must instantiate DualDomainTextIntentGenerator
+    directly. This alias preserves old imports without keeping the abandoned image
+    MLP intent route alive.
+    """
+    pass

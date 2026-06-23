@@ -7,10 +7,11 @@ from .fft_utils import split_amplitude_phase, phase_wrap, rebuild_from_amplitude
 from .scoring import TokenScoreNet
 from .interaction import SelectedTokenInteraction
 from .bypass import LightweightTokenPreserver
+from .selection import topk_token_selection, straight_through_topk_mask, gather_tokens, scatter_tokens
 
 
 class TGSFF(nn.Module):
-    """Text-guided selective frequency fusion with Gumbel-Softmax routing."""
+    """Text-guided selective frequency fusion with straight-through Top-K routing."""
 
     def __init__(self, in_channels: int = 64, patch_size: int = 4, prior_dim: int = 64,
                  amp_topk_ratio: float = 0.25, phase_topk_ratio: float = 0.25,
@@ -23,6 +24,8 @@ class TGSFF(nn.Module):
         self.return_aux = return_aux
         self.routing_temperature = routing_temperature
         self.prior_dim = prior_dim
+        self.amp_topk_ratio = amp_topk_ratio
+        self.phase_topk_ratio = phase_topk_ratio
         token_dim = in_channels * patch_size * patch_size
 
         self.amp_score = TokenScoreNet(token_dim=token_dim, prior_dim=prior_dim, hidden_dim=token_embed_dim)
@@ -63,29 +66,30 @@ class TGSFF(nn.Module):
             raw_target = 0.50 * diff + 0.25 * energy + 0.25 * local_variation
         return self._normalize_token_target(raw_target)
 
-    def _route_gate(self, score: torch.Tensor) -> torch.Tensor:
-        logits = torch.stack([-score, score], dim=-1)
-        tau = max(float(self.routing_temperature), 1e-4)
-        if self.training:
-            return F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)[..., 1]
-        return torch.softmax(logits / tau, dim=-1)[..., 1]
-
-    def _fuse_branch(self, vis_map, ir_map, intent, scorer, interactor, bypass, branch_type: str):
+    def _fuse_branch(self, vis_map, ir_map, intent, scorer, interactor, bypass,
+                     branch_type: str, keep_ratio: float):
         vis_tokens, meta = patchify_feature_map(vis_map, self.patch_size)
         ir_tokens, _ = patchify_feature_map(ir_map, self.patch_size)
         score = scorer(vis_tokens, ir_tokens, meta['coords'], intent)
-        routing_gate = self._route_gate(score).unsqueeze(-1)
-        strong_full = interactor(vis_tokens, ir_tokens, intent)
+        topk_index, hard_mask, topk_value = topk_token_selection(score, keep_ratio)
+        routing_mask = straight_through_topk_mask(
+            score, hard_mask, keep_ratio, temperature=self.routing_temperature
+        ).unsqueeze(-1)
+
+        selected_vis = gather_tokens(vis_tokens, topk_index)
+        selected_ir = gather_tokens(ir_tokens, topk_index)
+        selected_strong = interactor(selected_vis, selected_ir, intent)
         weak_full = bypass(vis_tokens, ir_tokens, intent)
-        fused_full = routing_gate * strong_full + (1.0 - routing_gate) * weak_full
+        strong_full = scatter_tokens(weak_full, selected_strong, topk_index)
+        fused_full = routing_mask * strong_full + (1.0 - routing_mask) * weak_full
         fused_map = unpatchify_feature_map(fused_full, meta)
         aux = {
             'score': score,
             'score_target': self._build_score_target(vis_tokens, ir_tokens, branch_type=branch_type),
-            'mask': routing_gate.squeeze(-1).detach(),
-            'routing_mask': routing_gate.squeeze(-1),
-            'topk_index': torch.empty(0, device=score.device, dtype=torch.long),
-            'topk_value': torch.empty(0, device=score.device, dtype=score.dtype),
+            'mask': hard_mask,
+            'routing_mask': routing_mask.squeeze(-1),
+            'topk_index': topk_index,
+            'topk_value': topk_value,
         }
         return fused_map, aux
 
@@ -95,8 +99,14 @@ class TGSFF(nn.Module):
             frequency_intent = torch.zeros(vis_feat.shape[0], self.prior_dim, device=vis_feat.device, dtype=vis_feat.dtype)
         vis_amp, vis_phase = split_amplitude_phase(vis_feat)
         ir_amp, ir_phase = split_amplitude_phase(ir_feat)
-        fused_amp, amp_aux = self._fuse_branch(vis_amp, ir_amp, frequency_intent, self.amp_score, self.amp_interaction, self.amp_bypass, 'amp')
-        fused_phase, phase_aux = self._fuse_branch(vis_phase, ir_phase, frequency_intent, self.phase_score, self.phase_interaction, self.phase_bypass, 'phase')
+        fused_amp, amp_aux = self._fuse_branch(
+            vis_amp, ir_amp, frequency_intent, self.amp_score, self.amp_interaction,
+            self.amp_bypass, 'amp', self.amp_topk_ratio
+        )
+        fused_phase, phase_aux = self._fuse_branch(
+            vis_phase, ir_phase, frequency_intent, self.phase_score, self.phase_interaction,
+            self.phase_bypass, 'phase', self.phase_topk_ratio
+        )
         fused_phase = phase_wrap(fused_phase)
         fused_spatial = rebuild_from_amplitude_phase(fused_amp, fused_phase, spatial_size)
         fused_feature = self.refine(fused_spatial)
@@ -120,6 +130,8 @@ class TGSFF(nn.Module):
             'phase_routing_mask': phase_aux['routing_mask'],
             'amp_topk_index': amp_aux['topk_index'],
             'phase_topk_index': phase_aux['topk_index'],
+            'amp_topk_value': amp_aux['topk_value'],
+            'phase_topk_value': phase_aux['topk_value'],
         }
         return fused_feature, aux
 

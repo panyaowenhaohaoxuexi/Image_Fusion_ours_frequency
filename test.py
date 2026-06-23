@@ -7,7 +7,7 @@ import torch.nn as nn
 import warnings
 import logging
 
-from net.Network import SharedEncoder, FusionDecoder, TextConditionedSpatialFusion, DualStreamIntentMLP, BFSC
+from net.Network import SharedEncoder, FusionDecoder, TextConditionedSpatialFusion, DualDomainTextIntentGenerator, DDA
 from net.frequency_fusion import TGSFF
 from utils.img_read_save import img_save, image_read_cv2
 
@@ -19,20 +19,22 @@ ckpt_path = r'./models/TextIntentDualDomainFusion_latest.pth'
 
 CLIP_MODEL_NAME = r'E:\yizuo_SCI\1_Code\Image_Fusion_ours_frequency\weight\clip\ViT-B-32.pt'
 CLIP_DOWNLOAD_ROOT = r'E:\yizuo_SCI\weights\clip'
+USE_LEARNABLE_PROMPT_EMBEDDING = False
 
 
-def build_model(device):
+def build_model(device, use_learnable_prompt_embedding: bool = USE_LEARNABLE_PROMPT_EMBEDDING):
     encoder = nn.DataParallel(
         SharedEncoder(inp_channels=1, feature_dim=64, inner_dim=24, num_blocks=1, num_heads=1, ffn_expansion_factor=2.0)
     ).to(device)
     intent_generator = nn.DataParallel(
-        DualStreamIntentMLP(
+        DualDomainTextIntentGenerator(
             channels=64,
             intent_dim=64,
             hidden_dim=256,
             clip_model_name=CLIP_MODEL_NAME,
             clip_download_root=CLIP_DOWNLOAD_ROOT,
-            use_clip_prompt_buffer=False,
+            use_clip_prompt_bank=True,
+            use_learnable_prompt_embedding=use_learnable_prompt_embedding,
         )
     ).to(device)
     frequency_fusion = nn.DataParallel(
@@ -57,11 +59,11 @@ def build_model(device):
             use_freq_context=False,
         )
     ).to(device)
-    bfsc = nn.DataParallel(BFSC(channels=64)).to(device)
+    dda = nn.DataParallel(DDA(channels=64)).to(device)
     decoder = nn.DataParallel(
         FusionDecoder(channels=64, out_channels=1, inner_dim=24, num_blocks=1, num_heads=1, ffn_expansion_factor=2.0)
     ).to(device)
-    return encoder, intent_generator, frequency_fusion, spatial_fusion, bfsc, decoder
+    return encoder, intent_generator, frequency_fusion, spatial_fusion, dda, decoder
 
 
 def _load_state(module, checkpoint, key, strict=True):
@@ -78,7 +80,7 @@ def normalize_to_uint8(tensor):
 
 def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    encoder, intent_generator, frequency_fusion, spatial_fusion, bfsc, decoder = build_model(device)
+    encoder, intent_generator, frequency_fusion, spatial_fusion, dda, decoder = build_model(device)
 
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f'Checkpoint not found: {ckpt_path}')
@@ -87,10 +89,10 @@ def main():
     _load_state(intent_generator, checkpoint, 'intent_generator', strict=True)
     _load_state(frequency_fusion, checkpoint, 'frequency_fusion', strict=True)
     _load_state(spatial_fusion, checkpoint, 'spatial_fusion', strict=True)
-    _load_state(bfsc, checkpoint, 'bfsc', strict=True)
+    _load_state(dda, checkpoint, 'dda', strict=True)
     _load_state(decoder, checkpoint, 'fusion_decoder', strict=True)
 
-    for module in [encoder, intent_generator, frequency_fusion, spatial_fusion, bfsc, decoder]:
+    for module in [encoder, intent_generator, frequency_fusion, spatial_fusion, dda, decoder]:
         module.eval()
 
     for dataset_name in ['MSRS']:
@@ -128,15 +130,13 @@ def main():
 
                 vis_spa, vis_freq, _ = encoder(data_vis)
                 ir_spa, ir_freq, _ = encoder(data_ir)
-                z_deg, z_fus = intent_generator(vis_spa, ir_spa, vis_freq, ir_freq)
-                fused_freq, _ = frequency_fusion(vis_freq, ir_freq, frequency_intent=z_deg)
-                fused_spa_coarse, _ = spatial_fusion(vis_spa, ir_spa, z_fus, coarse_only=True, return_aux=True)
-                _, g_coarse = bfsc(fused_freq, fused_spa_coarse)
-                fused_spa, _ = spatial_fusion(vis_spa, ir_spa, z_fus, feedback_gate=g_coarse, return_aux=True)
-                dual_feature, _ = bfsc(fused_freq, fused_spa)
+                I_deg, I_fus, _ = intent_generator(vis_spa, ir_spa, vis_freq, ir_freq)
+                fused_freq, _ = frequency_fusion(vis_freq, ir_freq, frequency_intent=I_deg)
+                fused_spa, _ = spatial_fusion(vis_spa, ir_spa, I_fus, return_aux=True)
+                dual_feature, _ = dda(fused_freq, fused_spa)
 
                 decoder_skip = 0.5 * (data_vis + data_ir)
-                data_fuse, _ = decoder(decoder_skip, dual_feature, fused_freq, text_intent=z_fus)
+                data_fuse, _ = decoder(decoder_skip, dual_feature, fused_freq)
 
                 fi = normalize_to_uint8(data_fuse)
                 ycrcb_fi = np.dstack((fi, data_vis_cr, data_vis_cb))

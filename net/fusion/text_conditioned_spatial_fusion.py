@@ -43,6 +43,30 @@ class SemanticAffineModulation(nn.Module):
         return gamma * self.norm(feat) + beta
 
 
+class PositionAdaptiveWeightGate(nn.Module):
+    """Single-channel IR gate conditioned on local VIS/IR features and I_fus."""
+
+    def __init__(self, channels: int = 64, intent_dim: int = 64):
+        super().__init__()
+        self.intent_proj = nn.Sequential(
+            nn.Linear(intent_dim, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels),
+        )
+        self.gate = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(channels, max(channels // 2, 1), 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(max(channels // 2, 1), 1, 1, 1, 0),
+        )
+
+    def forward(self, vis_feat: torch.Tensor, ir_feat: torch.Tensor, spatial_intent: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = vis_feat.shape
+        intent_map = self.intent_proj(spatial_intent).view(b, c, 1, 1).expand(-1, -1, h, w)
+        return torch.sigmoid(self.gate(torch.cat([vis_feat, ir_feat, intent_map], dim=1)))
+
+
 class ShallowSemanticFusionBlock(nn.Module):
     """L1/L2: semantic modulation followed by lightweight feature fusion."""
 
@@ -50,8 +74,9 @@ class ShallowSemanticFusionBlock(nn.Module):
         super().__init__()
         self.vis_mod = SemanticAffineModulation(channels, intent_dim)
         self.ir_mod = SemanticAffineModulation(channels, intent_dim)
+        self.weight_gate = PositionAdaptiveWeightGate(channels, intent_dim)
         self.fuse = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 3, 1, 1),
+            nn.Conv2d(channels, channels, 3, 1, 1),
             nn.GELU(),
             ResidualBlock(channels),
         )
@@ -59,12 +84,14 @@ class ShallowSemanticFusionBlock(nn.Module):
     def forward(self, vis_feat: torch.Tensor, ir_feat: torch.Tensor, z_fus: torch.Tensor):
         vis_tilde = self.vis_mod(vis_feat, z_fus)
         ir_tilde = self.ir_mod(ir_feat, z_fus)
-        fused = self.fuse(torch.cat([vis_tilde, ir_tilde], dim=1))
-        return fused, {'vis_tilde': vis_tilde, 'ir_tilde': ir_tilde}
+        weight_ir = self.weight_gate(vis_feat, ir_feat, z_fus)
+        gated = weight_ir * ir_tilde + (1.0 - weight_ir) * vis_tilde
+        fused = self.fuse(gated)
+        return fused, {'vis_tilde': vis_tilde, 'ir_tilde': ir_tilde, 'weight': weight_ir}
 
 
 class DeepSemanticCrossModalFusionBlock(nn.Module):
-    """L3: semantic modulation, bidirectional cross-attention, and context refinement."""
+    """L3: semantic modulation, cross-modal attention, and context refinement."""
 
     def __init__(self, channels: int = 64, intent_dim: int = 64, num_heads: int = 1,
                  ffn_expansion_factor: float = 2.0):
@@ -72,10 +99,11 @@ class DeepSemanticCrossModalFusionBlock(nn.Module):
         heads = _valid_heads(channels, num_heads)
         self.vis_mod = SemanticAffineModulation(channels, intent_dim)
         self.ir_mod = SemanticAffineModulation(channels, intent_dim)
+        self.weight_gate = PositionAdaptiveWeightGate(channels, intent_dim)
         self.vis_to_ir = nn.MultiheadAttention(channels, heads)
         self.ir_to_vis = nn.MultiheadAttention(channels, heads)
         self.fuse = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 3, 1, 1),
+            nn.Conv2d(channels, channels, 3, 1, 1),
             nn.GELU(),
         )
         self.context = TransformerBlock(channels, heads, ffn_expansion_factor, False, 'WithBias')
@@ -91,8 +119,7 @@ class DeepSemanticCrossModalFusionBlock(nn.Module):
         b, _, c = x.shape
         return x.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
 
-    def forward(self, vis_feat: torch.Tensor, ir_feat: torch.Tensor, z_fus: torch.Tensor,
-                feedback_gate: Optional[torch.Tensor] = None):
+    def forward(self, vis_feat: torch.Tensor, ir_feat: torch.Tensor, z_fus: torch.Tensor):
         _, _, h, w = vis_feat.shape
         vis_tilde = self.vis_mod(vis_feat, z_fus)
         ir_tilde = self.ir_mod(ir_feat, z_fus)
@@ -108,14 +135,18 @@ class DeepSemanticCrossModalFusionBlock(nn.Module):
         ir_update = ir_update_t.transpose(0, 1)
         vis_hat = self._to_map(vis_tokens + vis_update, h, w)
         ir_hat = self._to_map(ir_tokens + ir_update, h, w)
-        fused = self.fuse(torch.cat([vis_hat, ir_hat], dim=1))
-        if feedback_gate is not None:
-            if feedback_gate.shape[-2:] != (h, w):
-                feedback_gate = F.interpolate(feedback_gate, size=(h, w), mode='bilinear', align_corners=False)
-            fused = fused * (1.0 + feedback_gate)
+        weight_ir = self.weight_gate(vis_feat, ir_feat, z_fus)
+        gated = weight_ir * ir_hat + (1.0 - weight_ir) * vis_hat
+        fused = self.fuse(gated)
         fused = self.context(fused)
         fused = self.residual(fused) + fused
-        return fused, {'vis_tilde': vis_tilde, 'ir_tilde': ir_tilde, 'vis_hat': vis_hat, 'ir_hat': ir_hat}
+        return fused, {
+            'vis_tilde': vis_tilde,
+            'ir_tilde': ir_tilde,
+            'vis_hat': vis_hat,
+            'ir_hat': ir_hat,
+            'weight': weight_ir,
+        }
 
 
 class TopDownSemanticBlock(nn.Module):
@@ -159,25 +190,11 @@ class TGCSF(nn.Module):
         return l1, l2, l3
 
     def forward(self, vis_spa: TensorOrPyramid, ir_spa: TensorOrPyramid, spatial_intent: torch.Tensor,
-                feedback_gate: Optional[torch.Tensor] = None, coarse_only: bool = False,
                 return_aux: bool = False):
         vis_l1, vis_l2, vis_l3 = self._as_three_levels(vis_spa)
         ir_l1, ir_l2, ir_l3 = self._as_three_levels(ir_spa)
 
-        fused_l3, aux_l3 = self.level3(vis_l3, ir_l3, spatial_intent, feedback_gate)
-        if coarse_only:
-            coarse = F.interpolate(fused_l3, size=vis_l1.shape[-2:], mode='bilinear', align_corners=False)
-            if not return_aux:
-                return coarse
-            return coarse, {
-                'fused_l1': coarse,
-                'fused_l2': F.interpolate(fused_l3, size=vis_l2.shape[-2:], mode='bilinear', align_corners=False),
-                'fused_l3': fused_l3,
-                'td_l2': F.interpolate(fused_l3, size=vis_l2.shape[-2:], mode='bilinear', align_corners=False),
-                'td_l1': coarse,
-                'l3_aux': aux_l3,
-            }
-
+        fused_l3, aux_l3 = self.level3(vis_l3, ir_l3, spatial_intent)
         fused_l1, aux_l1 = self.level1(vis_l1, ir_l1, spatial_intent)
         fused_l2, aux_l2 = self.level2(vis_l2, ir_l2, spatial_intent)
         td_l2 = self.topdown_l2(fused_l3, fused_l2)
@@ -196,6 +213,9 @@ class TGCSF(nn.Module):
             'l1_aux': aux_l1,
             'l2_aux': aux_l2,
             'l3_aux': aux_l3,
+            'weight_l1': aux_l1['weight'],
+            'weight_l2': aux_l2['weight'],
+            'weight_l3': aux_l3['weight'],
             'spatial_res_scale': self.res_scale.detach(),
         }
         return out, aux
