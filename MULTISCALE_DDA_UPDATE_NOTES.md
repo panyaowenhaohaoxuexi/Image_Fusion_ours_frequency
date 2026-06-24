@@ -32,6 +32,12 @@ SharedEncoder
 * `spatial_pyramid["l3"]` is the 1/4-resolution spatial feature.
 * `freq_pyramid["l1"]`, `freq_pyramid["l2"]`, and `freq_pyramid["l3"]` are interpolated inside FrequencyPyramidAdapter to exactly match the corresponding spatial level.
 
+## Training Loss Policy
+
+The current training code still uses intent alignment loss and CLIP semantic
+consistency loss as auxiliary objectives. Removing those losses would be a
+separate training-objective change; `utils/loss.py` is unchanged.
+
 ## Checkpoint Policy
 
 Old v10 checkpoints are structurally incompatible with the new multi-scale DDA

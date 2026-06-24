@@ -4,14 +4,12 @@ import torch.nn as nn
 
 
 class TokenScoreNet(nn.Module):
-    """Token 重要性评分网络。
+    """Estimate degradation-aware importance scores for frequency tokens.
 
-    评分依据显式拆成三类：
-    1) Token Feature：可见光 / 红外 token 自身表征；
-    2) Cross-modal Difference：两模态 token 的互补差异；
-    3) Text Intent Embedding：由固定 prompt bank / CLIP text encoder 得到的高层意图。
-
-    输出 score 只用于 Top-K 排序和路由，不直接作为频谱值的全局缩放因子。
+    The degradation intent I_deg generates FiLM-style modulation parameters to
+    recalibrate intermediate scoring representations before importance scoring
+    and Top-K routing. I_deg does not directly change amplitude/phase spectral
+    values and does not modulate downstream token fusion features.
     """
 
     def __init__(self, token_dim: int, prior_dim: int, hidden_dim: int = 128):
@@ -30,13 +28,15 @@ class TokenScoreNet(nn.Module):
             nn.Linear(2, hidden_dim // 4),
             nn.GELU(),
         )
-        self.prior_proj = nn.Sequential(
-            nn.Linear(prior_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+        self.intent_mod = nn.Sequential(
+            nn.Linear(prior_dim, hidden_dim * 2),
             nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim * 4),
         )
+        nn.init.zeros_(self.intent_mod[-1].weight)
+        nn.init.zeros_(self.intent_mod[-1].bias)
         self.score_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 3 + hidden_dim // 4, hidden_dim),
+            nn.Linear(hidden_dim * 2 + hidden_dim // 4, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
@@ -51,15 +51,17 @@ class TokenScoreNet(nn.Module):
         coords:     [B, N, 2]
         intent:     [B, P]
         """
-        _, n, _ = vis_tokens.shape
         token_feature = torch.cat([vis_tokens, ir_tokens], dim=-1)
         cross_modal_difference = torch.abs(vis_tokens - ir_tokens)
 
         token_feat = self.token_proj(token_feature)
         diff_feat = self.diff_proj(cross_modal_difference)
         coord_feat = self.coord_proj(coords)
-        text_feat = self.prior_proj(intent).unsqueeze(1).expand(-1, n, -1)
 
-        fused = torch.cat([token_feat, diff_feat, text_feat, coord_feat], dim=-1)
+        gamma_t, beta_t, gamma_d, beta_d = self.intent_mod(intent).chunk(4, dim=-1)
+        token_feat = token_feat * (1.0 + gamma_t.unsqueeze(1)) + beta_t.unsqueeze(1)
+        diff_feat = diff_feat * (1.0 + gamma_d.unsqueeze(1)) + beta_d.unsqueeze(1)
+
+        fused = torch.cat([token_feat, diff_feat, coord_feat], dim=-1)
         score = self.score_mlp(fused).squeeze(-1)
         return score
