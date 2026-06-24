@@ -5,6 +5,7 @@ from net.fusion.text_conditioned_spatial_fusion import TGCSF as _TGCSF
 from net.decoder.simple_decoder import SimpleDecoder
 from net.intent import DualDomainTextIntentGenerator
 from net.dda import DDA
+from net.frequency_fusion import FrequencyPyramidAdapter
 
 
 class SharedEncoder(SimpleSharedEncoder):

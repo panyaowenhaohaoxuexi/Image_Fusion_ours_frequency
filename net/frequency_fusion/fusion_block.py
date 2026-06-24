@@ -39,11 +39,6 @@ class TGSFF(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(in_channels, in_channels, 3, 1, 1),
         )
-        self.refine_affine = nn.Sequential(
-            nn.Linear(prior_dim, in_channels * 2),
-            nn.GELU(),
-            nn.Linear(in_channels * 2, in_channels * 2),
-        )
 
     @staticmethod
     def _normalize_token_target(x: torch.Tensor) -> torch.Tensor:
@@ -110,10 +105,6 @@ class TGSFF(nn.Module):
         fused_phase = phase_wrap(fused_phase)
         fused_spatial = rebuild_from_amplitude_phase(fused_amp, fused_phase, spatial_size)
         fused_feature = self.refine(fused_spatial)
-        gamma, beta = self.refine_affine(frequency_intent).chunk(2, dim=-1)
-        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
-        beta = beta.unsqueeze(-1).unsqueeze(-1)
-        fused_feature = fused_feature * (1.0 + 0.1 * torch.tanh(gamma)) + 0.1 * beta
         fused_feature = fused_feature + 0.5 * (vis_feat + ir_feat)
 
         if not self.return_aux:

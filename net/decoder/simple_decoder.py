@@ -2,8 +2,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from net.restormer_light import TransformerBlock
+
 from net.encoder.blocks import ConvBNAct, ResidualBlock
+from net.restormer_light import TransformerBlock
 
 
 def _valid_heads(channels: int, requested: int) -> int:
@@ -31,23 +32,15 @@ class DecoderStage(nn.Module):
 
 
 class SimpleDecoder(nn.Module):
-    """
-    三层融合解码器。
-
-    接口保持：
-        forward(inp_img, base_feature, freq_feature)
-
-    输入 F_spa / F_freq 后构建 L1/L2/L3 内部金字塔；L3、L2、L1 每一级
-    仅使用图像域特征重建，文本不进入解码器。
-    """
+    """Multi-scale decoder fed only by image skip and DDA pyramid features."""
 
     def __init__(self, channels=64, out_channels=1, inner_dim=24, num_blocks=1,
                  num_heads=1, ffn_expansion_factor=2.0, bias=False,
                  LayerNorm_type='WithBias'):
         super().__init__()
-        self.reduce_l1 = nn.Conv2d(channels * 2, inner_dim, kernel_size=1, bias=bias)
-        self.down_l2 = nn.Sequential(nn.Conv2d(inner_dim, inner_dim, 3, 2, 1, bias=bias), nn.GELU())
-        self.down_l3 = nn.Sequential(nn.Conv2d(inner_dim, inner_dim, 3, 2, 1, bias=bias), nn.GELU())
+        self.reduce_l1 = nn.Conv2d(channels, inner_dim, kernel_size=1, bias=bias)
+        self.reduce_l2 = nn.Conv2d(channels, inner_dim, kernel_size=1, bias=bias)
+        self.reduce_l3 = nn.Conv2d(channels, inner_dim, kernel_size=1, bias=bias)
 
         self.stage_l3 = nn.ModuleList([
             DecoderStage(inner_dim, num_heads, ffn_expansion_factor, bias, LayerNorm_type)
@@ -75,10 +68,11 @@ class SimpleDecoder(nn.Module):
             x = block(x)
         return x
 
-    def forward(self, inp_img: torch.Tensor, base_feature: torch.Tensor, freq_feature: torch.Tensor):
-        x_l1 = self.reduce_l1(torch.cat([base_feature, freq_feature], dim=1))
-        x_l2 = self.down_l2(x_l1)
-        x_l3 = self.down_l3(x_l2)
+    def forward(self, decoder_skip: torch.Tensor, D_L1: torch.Tensor,
+                D_L2: torch.Tensor, D_L3: torch.Tensor):
+        x_l1 = self.reduce_l1(D_L1)
+        x_l2 = self.reduce_l2(D_L2)
+        x_l3 = self.reduce_l3(D_L3)
 
         d_l3 = self._run_stage(self.stage_l3, x_l3)
         d_l2 = self.fuse_l2(torch.cat([
@@ -93,5 +87,5 @@ class SimpleDecoder(nn.Module):
         d_l1 = self._run_stage(self.stage_l1, d_l1)
 
         out = self.head(d_l1)
-        out = out + inp_img
+        out = out + decoder_skip
         return torch.sigmoid(out), d_l1

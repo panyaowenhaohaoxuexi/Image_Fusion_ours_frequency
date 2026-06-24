@@ -20,11 +20,6 @@ class LightweightTokenPreserver(nn.Module):
             nn.Linear(token_dim, token_dim),
             nn.Sigmoid(),
         )
-        self.intent_affine = nn.Sequential(
-            nn.Linear(prior_dim, token_dim),
-            nn.GELU(),
-            nn.Linear(token_dim, token_dim * 2),
-        )
         self.refine = nn.Sequential(
             nn.LayerNorm(token_dim),
             nn.Linear(token_dim, token_dim),
@@ -41,11 +36,5 @@ class LightweightTokenPreserver(nn.Module):
         concat = torch.cat([vis_tokens, ir_tokens], dim=-1)
         gate = self.gate(concat)
         mixed = gate * vis_tokens + (1.0 - gate) * ir_tokens
-
-        if intent is not None:
-            gamma, beta = self.intent_affine(intent).chunk(2, dim=-1)
-            gamma = torch.tanh(gamma).unsqueeze(1)
-            beta = torch.tanh(beta).unsqueeze(1)
-            mixed = mixed * (1.0 + 0.1 * gamma) + 0.05 * beta
 
         return mixed + self.res_scale * self.refine(mixed)

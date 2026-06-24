@@ -190,7 +190,7 @@ class TGCSF(nn.Module):
         return l1, l2, l3
 
     def forward(self, vis_spa: TensorOrPyramid, ir_spa: TensorOrPyramid, spatial_intent: torch.Tensor,
-                return_aux: bool = False):
+                return_aux: bool = False, return_pyramid: bool = False):
         vis_l1, vis_l2, vis_l3 = self._as_three_levels(vis_spa)
         ir_l1, ir_l2, ir_l3 = self._as_three_levels(ir_spa)
 
@@ -202,7 +202,13 @@ class TGCSF(nn.Module):
         refined = self.final_refine(td_l1)
         out = self.out_norm(td_l1 + self.res_scale * refined)
 
-        if not return_aux:
+        spatial_pyramid = {
+            'l1': out,
+            'l2': td_l2,
+            'l3': fused_l3,
+        }
+
+        if not return_aux and not return_pyramid:
             return out
         aux: Dict[str, torch.Tensor] = {
             'fused_l1': fused_l1,
@@ -218,6 +224,10 @@ class TGCSF(nn.Module):
             'weight_l3': aux_l3['weight'],
             'spatial_res_scale': self.res_scale.detach(),
         }
+        if return_pyramid:
+            if return_aux:
+                return out, spatial_pyramid, aux
+            return out, spatial_pyramid
         return out, aux
 
 

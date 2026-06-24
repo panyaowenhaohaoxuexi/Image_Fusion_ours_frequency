@@ -26,11 +26,6 @@ class SelectedTokenInteraction(nn.Module):
         self.norm_self = nn.LayerNorm(embed_dim)
         self.norm_ffn = nn.LayerNorm(embed_dim)
 
-        self.intent_affine = nn.Sequential(
-            nn.Linear(prior_dim, embed_dim * 2),
-            nn.GELU(),
-            nn.Linear(embed_dim * 2, embed_dim * 2),
-        )
         self.ffn = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 2),
             nn.GELU(),
@@ -42,7 +37,7 @@ class SelectedTokenInteraction(nn.Module):
         """
         vis_tokens: [B, K, C]
         ir_tokens:  [B, K, C]
-        intent:     [B, P] or None
+        intent:     kept for caller compatibility; not used for feature modulation
         """
         vis_embed = self.vis_proj(vis_tokens)   # [B, K, E]
         ir_embed = self.ir_proj(ir_tokens)      # [B, K, E]
@@ -57,12 +52,6 @@ class SelectedTokenInteraction(nn.Module):
         ir_update = self.norm_ir(ir_embed + ir_update_t.transpose(0, 1))
 
         fused = self.norm_cross(0.5 * (vis_update + ir_update))
-
-        if intent is not None:
-            gamma, beta = self.intent_affine(intent).chunk(2, dim=-1)
-            gamma = gamma.unsqueeze(1)
-            beta = beta.unsqueeze(1)
-            fused = fused * (1.0 + 0.1 * torch.tanh(gamma)) + 0.1 * beta
 
         fused_t = fused.transpose(0, 1)
         self_update_t, _ = self.self_attn(fused_t, fused_t, fused_t)

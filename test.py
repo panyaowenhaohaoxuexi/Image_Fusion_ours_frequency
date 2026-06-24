@@ -7,7 +7,14 @@ import torch.nn as nn
 import warnings
 import logging
 
-from net.Network import SharedEncoder, FusionDecoder, TextConditionedSpatialFusion, DualDomainTextIntentGenerator, DDA
+from net.Network import (
+    SharedEncoder,
+    FusionDecoder,
+    TextConditionedSpatialFusion,
+    DualDomainTextIntentGenerator,
+    DDA,
+    FrequencyPyramidAdapter,
+)
 from net.frequency_fusion import TGSFF
 from utils.img_read_save import img_save, image_read_cv2
 
@@ -49,6 +56,7 @@ def build_model(device, use_learnable_prompt_embedding: bool = USE_LEARNABLE_PRO
             routing_temperature=0.25,
         )
     ).to(device)
+    frequency_pyramid_adapter = nn.DataParallel(FrequencyPyramidAdapter(channels=64)).to(device)
     spatial_fusion = nn.DataParallel(
         TextConditionedSpatialFusion(
             channels=64,
@@ -59,11 +67,23 @@ def build_model(device, use_learnable_prompt_embedding: bool = USE_LEARNABLE_PRO
             use_freq_context=False,
         )
     ).to(device)
-    dda = nn.DataParallel(DDA(channels=64)).to(device)
-    decoder = nn.DataParallel(
+    dda_l1 = nn.DataParallel(DDA(channels=64)).to(device)
+    dda_l2 = nn.DataParallel(DDA(channels=64)).to(device)
+    dda_l3 = nn.DataParallel(DDA(channels=64)).to(device)
+    fusion_decoder = nn.DataParallel(
         FusionDecoder(channels=64, out_channels=1, inner_dim=24, num_blocks=1, num_heads=1, ffn_expansion_factor=2.0)
     ).to(device)
-    return encoder, intent_generator, frequency_fusion, spatial_fusion, dda, decoder
+    return (
+        encoder,
+        intent_generator,
+        frequency_fusion,
+        frequency_pyramid_adapter,
+        spatial_fusion,
+        dda_l1,
+        dda_l2,
+        dda_l3,
+        fusion_decoder,
+    )
 
 
 def _load_state(module, checkpoint, key, strict=True):
@@ -80,7 +100,17 @@ def normalize_to_uint8(tensor):
 
 def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    encoder, intent_generator, frequency_fusion, spatial_fusion, dda, decoder = build_model(device)
+    (
+        encoder,
+        intent_generator,
+        frequency_fusion,
+        frequency_pyramid_adapter,
+        spatial_fusion,
+        dda_l1,
+        dda_l2,
+        dda_l3,
+        fusion_decoder,
+    ) = build_model(device)
 
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f'Checkpoint not found: {ckpt_path}')
@@ -88,11 +118,24 @@ def main():
     _load_state(encoder, checkpoint, 'shared_encoder', strict=True)
     _load_state(intent_generator, checkpoint, 'intent_generator', strict=True)
     _load_state(frequency_fusion, checkpoint, 'frequency_fusion', strict=True)
+    _load_state(frequency_pyramid_adapter, checkpoint, 'frequency_pyramid_adapter', strict=True)
     _load_state(spatial_fusion, checkpoint, 'spatial_fusion', strict=True)
-    _load_state(dda, checkpoint, 'dda', strict=True)
-    _load_state(decoder, checkpoint, 'fusion_decoder', strict=True)
+    _load_state(dda_l1, checkpoint, 'dda_l1', strict=True)
+    _load_state(dda_l2, checkpoint, 'dda_l2', strict=True)
+    _load_state(dda_l3, checkpoint, 'dda_l3', strict=True)
+    _load_state(fusion_decoder, checkpoint, 'fusion_decoder', strict=True)
 
-    for module in [encoder, intent_generator, frequency_fusion, spatial_fusion, dda, decoder]:
+    for module in [
+        encoder,
+        intent_generator,
+        frequency_fusion,
+        frequency_pyramid_adapter,
+        spatial_fusion,
+        dda_l1,
+        dda_l2,
+        dda_l3,
+        fusion_decoder,
+    ]:
         module.eval()
 
     for dataset_name in ['MSRS']:
@@ -132,11 +175,17 @@ def main():
                 ir_spa, ir_freq, _ = encoder(data_ir)
                 I_deg, I_fus, _ = intent_generator(vis_spa, ir_spa, vis_freq, ir_freq)
                 fused_freq, _ = frequency_fusion(vis_freq, ir_freq, frequency_intent=I_deg)
-                fused_spa, _ = spatial_fusion(vis_spa, ir_spa, I_fus, return_aux=True)
-                dual_feature, _ = dda(fused_freq, fused_spa)
+                spatial_out, spatial_pyramid, _ = spatial_fusion(
+                    vis_spa, ir_spa, I_fus, return_aux=True, return_pyramid=True
+                )
+                freq_pyramid = frequency_pyramid_adapter(fused_freq, target_pyramid=spatial_pyramid)
+                D_L1, gate_l1 = dda_l1(freq_pyramid["l1"], spatial_pyramid["l1"])
+                D_L2, gate_l2 = dda_l2(freq_pyramid["l2"], spatial_pyramid["l2"])
+                D_L3, gate_l3 = dda_l3(freq_pyramid["l3"], spatial_pyramid["l3"])
+                dda_aux = {"gate_l1": gate_l1, "gate_l2": gate_l2, "gate_l3": gate_l3}
 
                 decoder_skip = 0.5 * (data_vis + data_ir)
-                data_fuse, _ = decoder(decoder_skip, dual_feature, fused_freq)
+                data_fuse, _ = fusion_decoder(decoder_skip, D_L1, D_L2, D_L3)
 
                 fi = normalize_to_uint8(data_fuse)
                 ycrcb_fi = np.dstack((fi, data_vis_cr, data_vis_cb))
