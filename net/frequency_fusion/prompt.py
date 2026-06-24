@@ -113,26 +113,3 @@ class CLIPTextPromptBank(nn.Module):
         prompt_bank = F.normalize(prompt_bank, dim=-1)
         return prompt_bank
 
-
-class IntentRouter(nn.Module):
-    def __init__(self, in_channels: int, prior_dim: int, num_prompts: int = 4):
-        super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.mlp = nn.Sequential(
-            nn.Linear(in_channels * 2, in_channels),
-            nn.ReLU(inplace=True),
-            nn.Linear(in_channels, num_prompts),
-        )
-        self.proj = nn.Linear(prior_dim, prior_dim)
-
-    def forward(self, vis_feat: torch.Tensor, ir_feat: torch.Tensor, prompt_bank: torch.Tensor):
-        b, c, _, _ = vis_feat.shape
-        vis_vec = self.pool(vis_feat).view(b, c)
-        ir_vec = self.pool(ir_feat).view(b, c)
-        fusion_vec = torch.cat([vis_vec, ir_vec], dim=1)
-        prompt_logits = self.mlp(fusion_vec)
-        prompt_weight = torch.softmax(prompt_logits, dim=1)
-        prompt_bank = prompt_bank.unsqueeze(0).repeat(b, 1, 1)
-        intent = torch.sum(prompt_weight.unsqueeze(-1) * prompt_bank, dim=1)
-        intent = self.proj(intent)
-        return intent, prompt_weight

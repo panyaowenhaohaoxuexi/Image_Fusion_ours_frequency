@@ -225,7 +225,11 @@ class IntentAlignmentLoss(nn.Module):
 
 
 class CLIPSemanticConsistencyLoss(nn.Module):
-    """Frozen CLIP image-feature consistency for VIS/IR/Fused grayscale tensors."""
+    """Frozen CLIP image-feature consistency for VIS/IR/Fused grayscale tensors.
+
+    CLIPSemanticConsistencyLoss is used only as a training-time semantic loss.
+    It is not part of the inference forward path and does not generate text intents.
+    """
 
     def __init__(self, clip_model_name: str = 'ViT-B/32', download_root: str = None,
                  image_size: int = 224):

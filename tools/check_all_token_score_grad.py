@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
+import inspect
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
@@ -78,15 +79,24 @@ def _assert_convex_hull(generator, mode_name):
             raise AssertionError(f'{mode_name} I_fus is not exactly weight @ bank')
 
 
-def _run_full_gradient_check(use_learnable_prompt_embedding: bool):
+def _assert_signatures():
+    decoder_params = list(inspect.signature(SimpleDecoder.forward).parameters)
+    dda_params = list(inspect.signature(DDA.forward).parameters)
+    if decoder_params != ['self', 'inp_img', 'base_feature', 'freq_feature']:
+        raise AssertionError(f'SimpleDecoder.forward signature is {decoder_params}')
+    if dda_params != ['self', 'F_freq', 'F_spa']:
+        raise AssertionError(f'DDA.forward signature is {dda_params}')
+
+
+def _run_full_gradient_check(mode_name: str, use_clip_prompt_bank: bool,
+                             use_learnable_prompt_embedding: bool):
     torch.manual_seed(0)
-    mode_name = 'learnable' if use_learnable_prompt_embedding else 'clip'
     intent = DualDomainTextIntentGenerator(
         channels=4,
         intent_dim=8,
         hidden_dim=16,
         use_learnable_prompt_embedding=use_learnable_prompt_embedding,
-        use_clip_prompt_bank=not use_learnable_prompt_embedding,
+        use_clip_prompt_bank=use_clip_prompt_bank,
     )
     freq_model = HighLevelGuidedFrequencyFusion(
         in_channels=4,
@@ -111,7 +121,6 @@ def _run_full_gradient_check(use_learnable_prompt_embedding: bool):
         inner_dim=8,
         num_blocks=1,
         num_heads=1,
-        intent_dim=8,
     )
     score_criterion = TokenRoutingRankingLoss()
 
@@ -124,6 +133,8 @@ def _run_full_gradient_check(use_learnable_prompt_embedding: bool):
     I_fus.retain_grad()
 
     fused_freq, freq_aux = freq_model(vis, ir, frequency_intent=I_deg)
+    if not torch.equal(freq_aux['frequency_intent'], I_deg):
+        raise AssertionError(f'{mode_name} frequency branch did not receive I_deg')
     fused_spa, spa_aux = spatial_model(vis, ir, I_fus, return_aux=True)
     dual_feature, dda_gate = dda(fused_freq, fused_spa)
     fused_img, _ = decoder(decoder_skip, dual_feature, fused_freq)
@@ -173,8 +184,10 @@ def _run_full_gradient_check(use_learnable_prompt_embedding: bool):
 
 
 def main():
-    _run_full_gradient_check(use_learnable_prompt_embedding=False)
-    _run_full_gradient_check(use_learnable_prompt_embedding=True)
+    _assert_signatures()
+    _run_full_gradient_check('fallback', use_clip_prompt_bank=False, use_learnable_prompt_embedding=False)
+    _run_full_gradient_check('clip', use_clip_prompt_bank=True, use_learnable_prompt_embedding=False)
+    _run_full_gradient_check('learnable', use_clip_prompt_bank=False, use_learnable_prompt_embedding=True)
 
 
 if __name__ == '__main__':

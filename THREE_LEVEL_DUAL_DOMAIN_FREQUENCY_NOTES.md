@@ -1,4 +1,9 @@
-# Three-level Dual-domain Text-intent Fusion Notes
+# [DEPRECATED] Three-level Dual-domain Text-intent Fusion Notes
+
+This note describes an earlier three-level frequency design and a decoder text-intent
+path. It conflicts with the final Text-FSFuse route, which uses single-level
+frequency fusion, dual-domain text-weighted intents, terminal DDA aggregation,
+and a text-free decoder. Keep this file only as historical reference.
 
 本版本在 v8 三层空间 SPGFusion/Text-IF 分支基础上，将频率域也升级为三层多尺度结构，使空间域与频率域保持同构。
 

@@ -119,6 +119,8 @@ class DualDomainTextIntentGenerator(nn.Module):
             "fus_prompt_weight": fus_prompt_weight,
             "deg_prompt_bank": deg_bank,
             "fus_prompt_bank": fus_bank,
+            "deg_prompt_texts": DEGRADATION_PROMPTS,
+            "fus_prompt_texts": FUSION_PROMPTS,
             "deg_prompt_logits": deg_logits,
             "fus_prompt_logits": fus_logits,
         }

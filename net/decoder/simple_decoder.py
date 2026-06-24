@@ -16,7 +16,7 @@ def _valid_heads(channels: int, requested: int) -> int:
 class DecoderStage(nn.Module):
     """Decoder stage with Restormer refinement."""
 
-    def __init__(self, channels: int, intent_dim: int, num_heads: int = 1,
+    def __init__(self, channels: int, num_heads: int = 1,
                  ffn_expansion_factor: float = 2.0, bias: bool = False,
                  layer_norm_type: str = 'WithBias'):
         super().__init__()
@@ -43,24 +43,24 @@ class SimpleDecoder(nn.Module):
 
     def __init__(self, channels=64, out_channels=1, inner_dim=24, num_blocks=1,
                  num_heads=1, ffn_expansion_factor=2.0, bias=False,
-                 LayerNorm_type='WithBias', intent_dim=64, use_text_guidance=True):
+                 LayerNorm_type='WithBias'):
         super().__init__()
         self.reduce_l1 = nn.Conv2d(channels * 2, inner_dim, kernel_size=1, bias=bias)
         self.down_l2 = nn.Sequential(nn.Conv2d(inner_dim, inner_dim, 3, 2, 1, bias=bias), nn.GELU())
         self.down_l3 = nn.Sequential(nn.Conv2d(inner_dim, inner_dim, 3, 2, 1, bias=bias), nn.GELU())
 
         self.stage_l3 = nn.ModuleList([
-            DecoderStage(inner_dim, intent_dim, num_heads, ffn_expansion_factor, bias, LayerNorm_type)
+            DecoderStage(inner_dim, num_heads, ffn_expansion_factor, bias, LayerNorm_type)
             for _ in range(num_blocks)
         ])
         self.fuse_l2 = nn.Conv2d(inner_dim * 2, inner_dim, 1, 1, 0, bias=bias)
         self.stage_l2 = nn.ModuleList([
-            DecoderStage(inner_dim, intent_dim, num_heads, ffn_expansion_factor, bias, LayerNorm_type)
+            DecoderStage(inner_dim, num_heads, ffn_expansion_factor, bias, LayerNorm_type)
             for _ in range(num_blocks)
         ])
         self.fuse_l1 = nn.Conv2d(inner_dim * 2, inner_dim, 1, 1, 0, bias=bias)
         self.stage_l1 = nn.ModuleList([
-            DecoderStage(inner_dim, intent_dim, num_heads, ffn_expansion_factor, bias, LayerNorm_type)
+            DecoderStage(inner_dim, num_heads, ffn_expansion_factor, bias, LayerNorm_type)
             for _ in range(num_blocks)
         ])
         self.head = nn.Sequential(
