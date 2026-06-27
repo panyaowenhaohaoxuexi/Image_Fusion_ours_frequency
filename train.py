@@ -12,7 +12,7 @@ from net.Network import (
     FusionDecoder,
     TextConditionedSpatialFusion,
     DualDomainTextIntentGenerator,
-    DDA,
+    FSRC,
     FrequencyPyramidAdapter,
 )
 from net.frequency_fusion import TGSFF
@@ -74,9 +74,9 @@ def build_model(device: str, use_learnable_prompt_embedding: bool = USE_LEARNABL
             use_freq_context=False,
         )
     ).to(device)
-    dda_l1 = nn.DataParallel(DDA(channels=64)).to(device)
-    dda_l2 = nn.DataParallel(DDA(channels=64)).to(device)
-    dda_l3 = nn.DataParallel(DDA(channels=64)).to(device)
+    fsrc_l1 = nn.DataParallel(FSRC(channels=64)).to(device)
+    fsrc_l2 = nn.DataParallel(FSRC(channels=64)).to(device)
+    fsrc_l3 = nn.DataParallel(FSRC(channels=64)).to(device)
     fusion_decoder = nn.DataParallel(
         FusionDecoder(channels=64, out_channels=1, inner_dim=24, num_blocks=1, num_heads=1, ffn_expansion_factor=2.0)
     ).to(device)
@@ -86,24 +86,24 @@ def build_model(device: str, use_learnable_prompt_embedding: bool = USE_LEARNABL
         frequency_fusion,
         frequency_pyramid_adapter,
         spatial_fusion,
-        dda_l1,
-        dda_l2,
-        dda_l3,
+        fsrc_l1,
+        fsrc_l2,
+        fsrc_l3,
         fusion_decoder,
     )
 
 
 def save_checkpoint(path: str, encoder, intent_generator, frequency_fusion, frequency_pyramid_adapter,
-                    spatial_fusion, dda_l1, dda_l2, dda_l3, fusion_decoder):
+                    spatial_fusion, fsrc_l1, fsrc_l2, fsrc_l3, fusion_decoder):
     checkpoint = {
         'shared_encoder': encoder.state_dict(),
         'intent_generator': intent_generator.state_dict(),
         'frequency_fusion': frequency_fusion.state_dict(),
         'frequency_pyramid_adapter': frequency_pyramid_adapter.state_dict(),
         'spatial_fusion': spatial_fusion.state_dict(),
-        'dda_l1': dda_l1.state_dict(),
-        'dda_l2': dda_l2.state_dict(),
-        'dda_l3': dda_l3.state_dict(),
+        'fsrc_l1': fsrc_l1.state_dict(),
+        'fsrc_l2': fsrc_l2.state_dict(),
+        'fsrc_l3': fsrc_l3.state_dict(),
         'fusion_decoder': fusion_decoder.state_dict(),
     }
     torch.save(checkpoint, path)
@@ -143,9 +143,9 @@ def main():
         frequency_fusion,
         frequency_pyramid_adapter,
         spatial_fusion,
-        dda_l1,
-        dda_l2,
-        dda_l3,
+        fsrc_l1,
+        fsrc_l2,
+        fsrc_l3,
         fusion_decoder,
     ) = build_model(device)
 
@@ -155,9 +155,9 @@ def main():
         torch.optim.Adam(filter(lambda p: p.requires_grad, frequency_fusion.parameters()), lr=lr, weight_decay=weight_decay),
         torch.optim.Adam(filter(lambda p: p.requires_grad, frequency_pyramid_adapter.parameters()), lr=lr, weight_decay=weight_decay),
         torch.optim.Adam(filter(lambda p: p.requires_grad, spatial_fusion.parameters()), lr=lr, weight_decay=weight_decay),
-        torch.optim.Adam(filter(lambda p: p.requires_grad, dda_l1.parameters()), lr=lr, weight_decay=weight_decay),
-        torch.optim.Adam(filter(lambda p: p.requires_grad, dda_l2.parameters()), lr=lr, weight_decay=weight_decay),
-        torch.optim.Adam(filter(lambda p: p.requires_grad, dda_l3.parameters()), lr=lr, weight_decay=weight_decay),
+        torch.optim.Adam(filter(lambda p: p.requires_grad, fsrc_l1.parameters()), lr=lr, weight_decay=weight_decay),
+        torch.optim.Adam(filter(lambda p: p.requires_grad, fsrc_l2.parameters()), lr=lr, weight_decay=weight_decay),
+        torch.optim.Adam(filter(lambda p: p.requires_grad, fsrc_l3.parameters()), lr=lr, weight_decay=weight_decay),
         torch.optim.Adam(filter(lambda p: p.requires_grad, fusion_decoder.parameters()), lr=lr, weight_decay=weight_decay),
     ]
     schedulers = [torch.optim.lr_scheduler.StepLR(opt, step_size=optim_step, gamma=optim_gamma) for opt in optimizers]
@@ -183,9 +183,9 @@ def main():
                 frequency_fusion,
                 frequency_pyramid_adapter,
                 spatial_fusion,
-                dda_l1,
-                dda_l2,
-                dda_l3,
+                fsrc_l1,
+                fsrc_l2,
+                fsrc_l3,
                 fusion_decoder,
             ]
             for module in train_modules:
@@ -202,10 +202,10 @@ def main():
                 vis_spa, ir_spa, I_fus, return_aux=True, return_pyramid=True
             )
             freq_pyramid = frequency_pyramid_adapter(fused_freq, target_pyramid=spatial_pyramid)
-            D_L1, gate_l1 = dda_l1(freq_pyramid["l1"], spatial_pyramid["l1"])
-            D_L2, gate_l2 = dda_l2(freq_pyramid["l2"], spatial_pyramid["l2"])
-            D_L3, gate_l3 = dda_l3(freq_pyramid["l3"], spatial_pyramid["l3"])
-            dda_aux = {"gate_l1": gate_l1, "gate_l2": gate_l2, "gate_l3": gate_l3}
+            D_L1, gate_l1 = fsrc_l1(freq_pyramid["l1"], spatial_pyramid["l1"])
+            D_L2, gate_l2 = fsrc_l2(freq_pyramid["l2"], spatial_pyramid["l2"])
+            D_L3, gate_l3 = fsrc_l3(freq_pyramid["l3"], spatial_pyramid["l3"])
+            fsrc_aux = {"gate_l1": gate_l1, "gate_l2": gate_l2, "gate_l3": gate_l3}
 
             decoder_skip = 0.5 * (data_vis + data_ir)
             fused_image, decoder_feature = fusion_decoder(decoder_skip, D_L1, D_L2, D_L3)
@@ -254,10 +254,10 @@ def main():
     os.makedirs('models', exist_ok=True)
     save_checkpoint(os.path.join('models', 'TextIntentDualDomainFusion_' + timestamp + '.pth'),
                     shared_encoder, intent_generator, frequency_fusion, frequency_pyramid_adapter,
-                    spatial_fusion, dda_l1, dda_l2, dda_l3, fusion_decoder)
+                    spatial_fusion, fsrc_l1, fsrc_l2, fsrc_l3, fusion_decoder)
     save_checkpoint(os.path.join('models', 'TextIntentDualDomainFusion_latest.pth'),
                     shared_encoder, intent_generator, frequency_fusion, frequency_pyramid_adapter,
-                    spatial_fusion, dda_l1, dda_l2, dda_l3, fusion_decoder)
+                    spatial_fusion, fsrc_l1, fsrc_l2, fsrc_l3, fusion_decoder)
 
 
 if __name__ == '__main__':

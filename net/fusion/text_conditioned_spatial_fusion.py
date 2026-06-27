@@ -84,7 +84,7 @@ class ShallowSemanticFusionBlock(nn.Module):
     def forward(self, vis_feat: torch.Tensor, ir_feat: torch.Tensor, z_fus: torch.Tensor):
         vis_tilde = self.vis_mod(vis_feat, z_fus)
         ir_tilde = self.ir_mod(ir_feat, z_fus)
-        weight_ir = self.weight_gate(vis_feat, ir_feat, z_fus)
+        weight_ir = self.weight_gate(vis_tilde, ir_tilde, z_fus)
         gated = weight_ir * ir_tilde + (1.0 - weight_ir) * vis_tilde
         fused = self.fuse(gated)
         return fused, {'vis_tilde': vis_tilde, 'ir_tilde': ir_tilde, 'weight': weight_ir}
@@ -135,7 +135,7 @@ class DeepSemanticCrossModalFusionBlock(nn.Module):
         ir_update = ir_update_t.transpose(0, 1)
         vis_hat = self._to_map(vis_tokens + vis_update, h, w)
         ir_hat = self._to_map(ir_tokens + ir_update, h, w)
-        weight_ir = self.weight_gate(vis_feat, ir_feat, z_fus)
+        weight_ir = self.weight_gate(vis_hat, ir_hat, z_fus)
         gated = weight_ir * ir_hat + (1.0 - weight_ir) * vis_hat
         fused = self.fuse(gated)
         fused = self.context(fused)

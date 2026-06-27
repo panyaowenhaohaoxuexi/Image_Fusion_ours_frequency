@@ -12,7 +12,7 @@ from net.Network import (
     FusionDecoder,
     TextConditionedSpatialFusion,
     DualDomainTextIntentGenerator,
-    DDA,
+    FSRC,
     FrequencyPyramidAdapter,
 )
 from net.frequency_fusion import TGSFF
@@ -67,9 +67,9 @@ def build_model(device, use_learnable_prompt_embedding: bool = USE_LEARNABLE_PRO
             use_freq_context=False,
         )
     ).to(device)
-    dda_l1 = nn.DataParallel(DDA(channels=64)).to(device)
-    dda_l2 = nn.DataParallel(DDA(channels=64)).to(device)
-    dda_l3 = nn.DataParallel(DDA(channels=64)).to(device)
+    fsrc_l1 = nn.DataParallel(FSRC(channels=64)).to(device)
+    fsrc_l2 = nn.DataParallel(FSRC(channels=64)).to(device)
+    fsrc_l3 = nn.DataParallel(FSRC(channels=64)).to(device)
     fusion_decoder = nn.DataParallel(
         FusionDecoder(channels=64, out_channels=1, inner_dim=24, num_blocks=1, num_heads=1, ffn_expansion_factor=2.0)
     ).to(device)
@@ -79,9 +79,9 @@ def build_model(device, use_learnable_prompt_embedding: bool = USE_LEARNABLE_PRO
         frequency_fusion,
         frequency_pyramid_adapter,
         spatial_fusion,
-        dda_l1,
-        dda_l2,
-        dda_l3,
+        fsrc_l1,
+        fsrc_l2,
+        fsrc_l3,
         fusion_decoder,
     )
 
@@ -106,9 +106,9 @@ def main():
         frequency_fusion,
         frequency_pyramid_adapter,
         spatial_fusion,
-        dda_l1,
-        dda_l2,
-        dda_l3,
+        fsrc_l1,
+        fsrc_l2,
+        fsrc_l3,
         fusion_decoder,
     ) = build_model(device)
 
@@ -120,9 +120,9 @@ def main():
     _load_state(frequency_fusion, checkpoint, 'frequency_fusion', strict=True)
     _load_state(frequency_pyramid_adapter, checkpoint, 'frequency_pyramid_adapter', strict=True)
     _load_state(spatial_fusion, checkpoint, 'spatial_fusion', strict=True)
-    _load_state(dda_l1, checkpoint, 'dda_l1', strict=True)
-    _load_state(dda_l2, checkpoint, 'dda_l2', strict=True)
-    _load_state(dda_l3, checkpoint, 'dda_l3', strict=True)
+    _load_state(fsrc_l1, checkpoint, 'fsrc_l1', strict=True)
+    _load_state(fsrc_l2, checkpoint, 'fsrc_l2', strict=True)
+    _load_state(fsrc_l3, checkpoint, 'fsrc_l3', strict=True)
     _load_state(fusion_decoder, checkpoint, 'fusion_decoder', strict=True)
 
     for module in [
@@ -131,9 +131,9 @@ def main():
         frequency_fusion,
         frequency_pyramid_adapter,
         spatial_fusion,
-        dda_l1,
-        dda_l2,
-        dda_l3,
+        fsrc_l1,
+        fsrc_l2,
+        fsrc_l3,
         fusion_decoder,
     ]:
         module.eval()
@@ -179,10 +179,10 @@ def main():
                     vis_spa, ir_spa, I_fus, return_aux=True, return_pyramid=True
                 )
                 freq_pyramid = frequency_pyramid_adapter(fused_freq, target_pyramid=spatial_pyramid)
-                D_L1, gate_l1 = dda_l1(freq_pyramid["l1"], spatial_pyramid["l1"])
-                D_L2, gate_l2 = dda_l2(freq_pyramid["l2"], spatial_pyramid["l2"])
-                D_L3, gate_l3 = dda_l3(freq_pyramid["l3"], spatial_pyramid["l3"])
-                dda_aux = {"gate_l1": gate_l1, "gate_l2": gate_l2, "gate_l3": gate_l3}
+                D_L1, gate_l1 = fsrc_l1(freq_pyramid["l1"], spatial_pyramid["l1"])
+                D_L2, gate_l2 = fsrc_l2(freq_pyramid["l2"], spatial_pyramid["l2"])
+                D_L3, gate_l3 = fsrc_l3(freq_pyramid["l3"], spatial_pyramid["l3"])
+                fsrc_aux = {"gate_l1": gate_l1, "gate_l2": gate_l2, "gate_l3": gate_l3}
 
                 decoder_skip = 0.5 * (data_vis + data_ir)
                 data_fuse, _ = fusion_decoder(decoder_skip, D_L1, D_L2, D_L3)

@@ -32,7 +32,7 @@ class DecoderStage(nn.Module):
 
 
 class SimpleDecoder(nn.Module):
-    """Multi-scale decoder fed only by image skip and DDA pyramid features."""
+    """Multi-scale decoder fed only by image skip and FSRC pyramid features."""
 
     def __init__(self, channels=64, out_channels=1, inner_dim=24, num_blocks=1,
                  num_heads=1, ffn_expansion_factor=2.0, bias=False,
