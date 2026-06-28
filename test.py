@@ -184,8 +184,7 @@ def main():
                 D_L3, gate_l3 = fsrc_l3(freq_pyramid["l3"], spatial_pyramid["l3"])
                 fsrc_aux = {"gate_l1": gate_l1, "gate_l2": gate_l2, "gate_l3": gate_l3}
 
-                decoder_skip = 0.5 * (data_vis + data_ir)
-                data_fuse, _ = fusion_decoder(decoder_skip, D_L1, D_L2, D_L3)
+                data_fuse, _ = fusion_decoder(D_L1, D_L2, D_L3)
 
                 fi = normalize_to_uint8(data_fuse)
                 ycrcb_fi = np.dstack((fi, data_vis_cr, data_vis_cb))

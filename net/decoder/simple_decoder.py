@@ -32,7 +32,7 @@ class DecoderStage(nn.Module):
 
 
 class SimpleDecoder(nn.Module):
-    """Multi-scale decoder fed only by image skip and FSRC pyramid features."""
+    """Multi-scale decoder fed only by FSRC pyramid features."""
 
     def __init__(self, channels=64, out_channels=1, inner_dim=24, num_blocks=1,
                  num_heads=1, ffn_expansion_factor=2.0, bias=False,
@@ -68,8 +68,7 @@ class SimpleDecoder(nn.Module):
             x = block(x)
         return x
 
-    def forward(self, decoder_skip: torch.Tensor, D_L1: torch.Tensor,
-                D_L2: torch.Tensor, D_L3: torch.Tensor):
+    def forward(self, D_L1: torch.Tensor, D_L2: torch.Tensor, D_L3: torch.Tensor):
         x_l1 = self.reduce_l1(D_L1)
         x_l2 = self.reduce_l2(D_L2)
         x_l3 = self.reduce_l3(D_L3)
@@ -87,5 +86,4 @@ class SimpleDecoder(nn.Module):
         d_l1 = self._run_stage(self.stage_l1, d_l1)
 
         out = self.head(d_l1)
-        out = out + decoder_skip
         return torch.sigmoid(out), d_l1

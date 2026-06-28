@@ -207,8 +207,7 @@ def main():
             D_L3, gate_l3 = fsrc_l3(freq_pyramid["l3"], spatial_pyramid["l3"])
             fsrc_aux = {"gate_l1": gate_l1, "gate_l2": gate_l2, "gate_l3": gate_l3}
 
-            decoder_skip = 0.5 * (data_vis + data_ir)
-            fused_image, decoder_feature = fusion_decoder(decoder_skip, D_L1, D_L2, D_L3)
+            fused_image, decoder_feature = fusion_decoder(D_L1, D_L2, D_L3)
 
             fusion_loss, _, _ = criteria_fusion(data_vis, data_ir, fused_image)
             ssim_loss = criteria_ssim(fused_image, data_vis) + criteria_ssim(fused_image, data_ir)
