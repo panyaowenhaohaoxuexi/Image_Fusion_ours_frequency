@@ -39,8 +39,3 @@ class FrequencySpatialResidualCoupling(nn.Module):
 
 
 FSRC = FrequencySpatialResidualCoupling
-
-
-class DDA(FrequencySpatialResidualCoupling):
-    """Backward-compatible alias. New code should use FSRC."""
-    pass
