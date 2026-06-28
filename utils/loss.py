@@ -76,31 +76,84 @@ class SimpleSSIMLoss(nn.Module):
 
 
 class FrequencyConsistencyLoss(nn.Module):
-    def __init__(self, low_weight: float = 1.0, high_weight: float = 1.0):
+    """RPFNet-style adaptive frequency contrastive consistency loss.
+
+    low_weight/high_weight are kept for compatibility and mapped to the
+    positive and negative contrastive terms, respectively.
+    """
+
+    def __init__(
+        self,
+        low_weight: float = 1.0,
+        high_weight: float = 1.0,
+        eps: float = 1e-8,
+        detach_mask: bool = True,
+    ):
         super().__init__()
-        self.low_weight = low_weight
-        self.high_weight = high_weight
+        self.pos_weight = low_weight
+        self.neg_weight = high_weight
+        self.eps = eps
+        self.detach_mask = detach_mask
+
+    def _standardize(self, x: torch.Tensor) -> torch.Tensor:
+        mean = x.mean(dim=(-2, -1), keepdim=True)
+        std = x.std(dim=(-2, -1), keepdim=True, unbiased=False).clamp_min(self.eps)
+        return (x - mean) / std
+
+    def _adaptive_mask(self, ir: torch.Tensor, vis: torch.Tensor) -> torch.Tensor:
+        diff = ir - vis
+        ir_saliency = torch.sigmoid(self._standardize(ir))
+        diff_saliency = torch.sigmoid(self._standardize(diff))
+
+        enhanced = (
+            ir_saliency * (1.0 + diff_saliency)
+            + diff_saliency * (1.0 + ir_saliency)
+        ) * 0.5
+
+        mean = enhanced.mean(dim=(-2, -1), keepdim=True)
+        std = enhanced.std(dim=(-2, -1), keepdim=True, unbiased=False).clamp_min(self.eps)
+        threshold = mean + std
+        mask = (enhanced > threshold).float()
+
+        if self.detach_mask:
+            mask = mask.detach()
+        return mask
+
+    @staticmethod
+    def _fft_l1(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        fft_a = torch.fft.fft2(a, norm='ortho')
+        fft_b = torch.fft.fft2(b, norm='ortho')
+        return torch.mean(torch.abs(fft_a - fft_b))
 
     def forward(self, image_vis: torch.Tensor, image_ir: torch.Tensor, fused: torch.Tensor):
         vis = image_vis[:, :1, :, :]
         ir = image_ir[:, :1, :, :]
 
-        fused_amp = torch.abs(torch.fft.fft2(fused, norm='ortho'))
-        vis_amp = torch.abs(torch.fft.fft2(vis, norm='ortho'))
-        ir_amp = torch.abs(torch.fft.fft2(ir, norm='ortho'))
+        mask = self._adaptive_mask(ir, vis).clamp(min=0.0, max=1.0)
+        inv_mask = 1.0 - mask
 
-        low_target = 0.5 * (vis_amp + ir_amp)
-        low_loss = F.l1_loss(torch.log1p(fused_amp), torch.log1p(low_target))
+        f_ir_region = fused * mask
+        ir_region = ir * mask
 
-        fused_hp = fused - F.avg_pool2d(fused, 3, 1, 1)
-        vis_hp = vis - F.avg_pool2d(vis, 3, 1, 1)
-        ir_hp = ir - F.avg_pool2d(ir, 3, 1, 1)
+        f_vis_region = fused * inv_mask
+        vis_region = vis * inv_mask
 
-        high_target = torch.max(torch.abs(vis_hp), torch.abs(ir_hp))
-        high_loss = F.l1_loss(torch.abs(fused_hp), high_target)
+        ir_mismatch = ir * inv_mask
+        vis_mismatch = vis * mask
 
-        total = self.low_weight * low_loss + self.high_weight * high_loss
-        return total, low_loss, high_loss
+        pos_ir = self._fft_l1(f_ir_region, ir_region)
+        pos_vis = self._fft_l1(f_vis_region, vis_region)
+        pos_loss = pos_ir + pos_vis
+
+        neg_ir_cross = self._fft_l1(f_ir_region, ir_mismatch)
+        neg_vis_cross = self._fft_l1(f_ir_region, vis_mismatch)
+        neg_bg_ir = self._fft_l1(f_vis_region, ir_mismatch)
+        neg_bg_vis = self._fft_l1(f_vis_region, vis_mismatch)
+        neg_loss = neg_ir_cross + neg_vis_cross + neg_bg_ir + neg_bg_vis
+
+        denom = (self.neg_weight * neg_loss).clamp_min(self.eps)
+        total = self.pos_weight * pos_loss / denom
+        return total, pos_loss.detach(), neg_loss.detach()
 
 
 def cc(img1: torch.Tensor, img2: torch.Tensor):
