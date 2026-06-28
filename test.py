@@ -94,7 +94,6 @@ def _load_state(module, checkpoint, key, strict=True):
 
 def normalize_to_uint8(tensor):
     tensor = tensor.clamp(0.0, 1.0)
-    tensor = (tensor - torch.min(tensor)) / (torch.max(tensor) - torch.min(tensor) + 1e-8)
     return np.squeeze((tensor * 255.0).cpu().numpy()).astype(np.uint8)
 
 

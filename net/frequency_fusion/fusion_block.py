@@ -105,7 +105,6 @@ class TGSFF(nn.Module):
         fused_phase = phase_wrap(fused_phase)
         fused_spatial = rebuild_from_amplitude_phase(fused_amp, fused_phase, spatial_size)
         fused_feature = self.refine(fused_spatial)
-        fused_feature = fused_feature + 0.5 * (vis_feat + ir_feat)
 
         if not self.return_aux:
             return fused_feature
