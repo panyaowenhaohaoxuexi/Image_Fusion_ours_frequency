@@ -21,9 +21,6 @@ from utils.loss import (
     Fusionloss,
     SimpleSSIMLoss,
     FrequencyConsistencyLoss,
-    IntentAlignmentLoss,
-    CLIPSemanticConsistencyLoss,
-    TokenRoutingRankingLoss,
 )
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
@@ -119,9 +116,6 @@ def main():
     criteria_fusion = Fusionloss().to(device)
     criteria_ssim = SimpleSSIMLoss(window_size=11).to(device)
     criteria_freq = FrequencyConsistencyLoss(low_weight=1.0, high_weight=1.0).to(device)
-    criteria_align = IntentAlignmentLoss(temperature=0.07).to(device)
-    criteria_sem = CLIPSemanticConsistencyLoss(clip_model_name=CLIP_MODEL_NAME, download_root=CLIP_DOWNLOAD_ROOT).to(device)
-    criteria_route = TokenRoutingRankingLoss().to(device)
 
     num_epochs = 70
     lr = 1e-4
@@ -130,9 +124,6 @@ def main():
     coeff_fusion = 1.0
     coeff_ssim = 2.0
     coeff_freq = 0.5
-    coeff_align = 0.05
-    coeff_sem = 0.1
-    coeff_route = 0.05
     clip_grad_norm_value = 0.01
     optim_step = 20
     optim_gamma = 0.5
@@ -195,36 +186,28 @@ def main():
 
             vis_spa, vis_freq, _ = shared_encoder(data_vis)
             ir_spa, ir_freq, _ = shared_encoder(data_ir)
-            I_deg, I_fus, intent_aux = intent_generator(vis_spa, ir_spa, vis_freq, ir_freq)
+            I_deg, I_fus, _intent_aux = intent_generator(vis_spa, ir_spa, vis_freq, ir_freq)
 
-            fused_freq, freq_aux = frequency_fusion(vis_freq, ir_freq, frequency_intent=I_deg)
-            spatial_out, spatial_pyramid, spa_aux = spatial_fusion(
+            fused_freq, _freq_aux = frequency_fusion(vis_freq, ir_freq, frequency_intent=I_deg)
+            _spatial_out, spatial_pyramid, _spa_aux = spatial_fusion(
                 vis_spa, ir_spa, I_fus, return_aux=True, return_pyramid=True
             )
             freq_pyramid = frequency_pyramid_adapter(fused_freq, target_pyramid=spatial_pyramid)
             D_L1, gate_l1 = fsrc_l1(freq_pyramid["l1"], spatial_pyramid["l1"])
             D_L2, gate_l2 = fsrc_l2(freq_pyramid["l2"], spatial_pyramid["l2"])
             D_L3, gate_l3 = fsrc_l3(freq_pyramid["l3"], spatial_pyramid["l3"])
-            fsrc_aux = {"gate_l1": gate_l1, "gate_l2": gate_l2, "gate_l3": gate_l3}
+            _fsrc_aux = {"gate_l1": gate_l1, "gate_l2": gate_l2, "gate_l3": gate_l3}
 
-            fused_image, decoder_feature = fusion_decoder(D_L1, D_L2, D_L3)
+            fused_image, _decoder_feature = fusion_decoder(D_L1, D_L2, D_L3)
 
             fusion_loss, _, _ = criteria_fusion(data_vis, data_ir, fused_image)
             ssim_loss = criteria_ssim(fused_image, data_vis) + criteria_ssim(fused_image, data_ir)
             freq_loss, _, _ = criteria_freq(data_vis, data_ir, fused_image)
-            align_loss, _ = criteria_align(
-                I_deg, I_fus, intent_aux['deg_prompt_bank'], intent_aux['fus_prompt_bank']
-            )
-            sem_loss, _ = criteria_sem(data_vis, data_ir, fused_image)
-            route_loss, _ = criteria_route(freq_aux)
 
             loss = (
                 coeff_fusion * fusion_loss
                 + coeff_ssim * ssim_loss
                 + coeff_freq * freq_loss
-                + coeff_align * align_loss
-                + coeff_sem * sem_loss
-                + coeff_route * route_loss
             )
             loss.backward()
 
@@ -238,9 +221,9 @@ def main():
             time_left = datetime.timedelta(seconds=batches_left * (time.time() - prev_time))
             prev_time = time.time()
             sys.stdout.write(
-                '\r[Epoch %d/%d] [Batch %d/%d] [loss: %.6f] [align: %.6f] [sem: %.6f] [route: %.6f] ETA: %.10s' % (
+                '\r[Epoch %d/%d] [Batch %d/%d] [loss: %.6f] [fusion: %.6f] [ssim: %.6f] [freq: %.6f] ETA: %.10s' % (
                     epoch, num_epochs, i, len(loader['train']), loss.item(),
-                    align_loss.item(), sem_loss.item(), route_loss.item(), time_left
+                    fusion_loss.item(), ssim_loss.item(), freq_loss.item(), time_left
                 )
             )
 

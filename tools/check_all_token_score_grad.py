@@ -7,13 +7,12 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 import torch
 
-from net.dda import DDA
+from net.FSRC import FSRC
 from net.decoder.simple_decoder import SimpleDecoder
 from net.frequency_fusion.fusion_block import HighLevelGuidedFrequencyFusion
 from net.frequency_fusion.pyramid import FrequencyPyramidAdapter
 from net.fusion.text_conditioned_spatial_fusion import TextConditionedSpatialAdaptiveFusion
 from net.intent import DualDomainTextIntentGenerator
-from utils.loss import TokenRoutingRankingLoss
 
 
 def _assert_nonzero_grad(name, tensor):
@@ -82,11 +81,11 @@ def _assert_convex_hull(generator, mode_name):
 
 def _assert_signatures():
     decoder_params = list(inspect.signature(SimpleDecoder.forward).parameters)
-    dda_params = list(inspect.signature(DDA.forward).parameters)
-    if decoder_params != ['self', 'decoder_skip', 'D_L1', 'D_L2', 'D_L3']:
+    fsrc_params = list(inspect.signature(FSRC.forward).parameters)
+    if decoder_params != ['self', 'D_L1', 'D_L2', 'D_L3']:
         raise AssertionError(f'SimpleDecoder.forward signature is {decoder_params}')
-    if dda_params != ['self', 'F_freq', 'F_spa']:
-        raise AssertionError(f'DDA.forward signature is {dda_params}')
+    if fsrc_params != ['self', 'F_freq', 'F_spa']:
+        raise AssertionError(f'FSRC.forward signature is {fsrc_params}')
 
 
 def _run_full_gradient_check(mode_name: str, use_clip_prompt_bank: bool,
@@ -116,9 +115,9 @@ def _run_full_gradient_check(mode_name: str, use_clip_prompt_bank: bool,
         num_heads=1,
     )
     frequency_pyramid_adapter = FrequencyPyramidAdapter(channels=4)
-    dda_l1 = DDA(channels=4)
-    dda_l2 = DDA(channels=4)
-    dda_l3 = DDA(channels=4)
+    fsrc_l1 = FSRC(channels=4)
+    fsrc_l2 = FSRC(channels=4)
+    fsrc_l3 = FSRC(channels=4)
     decoder = SimpleDecoder(
         channels=4,
         out_channels=1,
@@ -126,11 +125,9 @@ def _run_full_gradient_check(mode_name: str, use_clip_prompt_bank: bool,
         num_blocks=1,
         num_heads=1,
     )
-    score_criterion = TokenRoutingRankingLoss()
 
     vis = torch.randn(1, 4, 8, 8, requires_grad=True)
     ir = torch.randn(1, 4, 8, 8, requires_grad=True)
-    decoder_skip = torch.randn(1, 1, 8, 8)
 
     I_deg, I_fus, intent_aux = intent(vis, ir, vis, ir)
     I_deg.retain_grad()
@@ -143,17 +140,16 @@ def _run_full_gradient_check(mode_name: str, use_clip_prompt_bank: bool,
         vis, ir, I_fus, return_aux=True, return_pyramid=True
     )
     freq_pyramid = frequency_pyramid_adapter(fused_freq, target_pyramid=spatial_pyramid)
-    D_L1, gate_l1 = dda_l1(freq_pyramid['l1'], spatial_pyramid['l1'])
-    D_L2, gate_l2 = dda_l2(freq_pyramid['l2'], spatial_pyramid['l2'])
-    D_L3, gate_l3 = dda_l3(freq_pyramid['l3'], spatial_pyramid['l3'])
-    fused_img, _ = decoder(decoder_skip, D_L1, D_L2, D_L3)
+    D_L1, gate_l1 = fsrc_l1(freq_pyramid['l1'], spatial_pyramid['l1'])
+    D_L2, gate_l2 = fsrc_l2(freq_pyramid['l2'], spatial_pyramid['l2'])
+    D_L3, gate_l3 = fsrc_l3(freq_pyramid['l3'], spatial_pyramid['l3'])
+    fused_img, _ = decoder(D_L1, D_L2, D_L3)
 
     freq_aux['amp_score'].retain_grad()
     freq_aux['phase_score'].retain_grad()
     gate_l1.retain_grad()
     spa_aux['weight_l1'].retain_grad()
 
-    score_loss, _ = score_criterion(freq_aux)
     loss = (
         fused_img.mean()
         + D_L1.abs().mean()
@@ -161,7 +157,6 @@ def _run_full_gradient_check(mode_name: str, use_clip_prompt_bank: bool,
         + D_L3.abs().mean()
         + spatial_out.abs().mean()
         + fused_freq.abs().mean()
-        + 0.03 * score_loss
         + I_deg.mean()
         + I_fus.mean()
     )
@@ -188,10 +183,9 @@ def _run_full_gradient_check(mode_name: str, use_clip_prompt_bank: bool,
     _assert_module_grad(f'{mode_name} amp_score module', freq_model.amp_score)
     _assert_module_grad(f'{mode_name} phase_score module', freq_model.phase_score)
     _assert_module_grad(f'{mode_name} spatial weight generator', spatial_model.level1.weight_gate)
-    _assert_module_grad(f'{mode_name} dda_l1 gate generator', dda_l1.gate)
+    _assert_module_grad(f'{mode_name} fsrc_l1 gate generator', fsrc_l1.gate)
 
     _assert_convex_hull(intent, mode_name)
-    print(f'{mode_name} score_loss:', score_loss.item())
 
 
 def main():

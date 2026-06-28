@@ -18,10 +18,11 @@ class TGSFF(nn.Module):
                  token_embed_dim: int = 128, num_heads: int = 4, return_aux: bool = False,
                  use_real_clip_prompt_bank: bool = False, clip_model_name: str = 'ViT-B/32',
                  prompt_texts=None, clip_download_root: str = None, clip_device: str = None,
-                 routing_temperature: float = 0.25):
+                 routing_temperature: float = 0.25, return_score_target: bool = False):
         super().__init__()
         self.patch_size = patch_size
         self.return_aux = return_aux
+        self.return_score_target = return_score_target
         self.routing_temperature = routing_temperature
         self.prior_dim = prior_dim
         self.amp_topk_ratio = amp_topk_ratio
@@ -80,12 +81,13 @@ class TGSFF(nn.Module):
         fused_map = unpatchify_feature_map(fused_full, meta)
         aux = {
             'score': score,
-            'score_target': self._build_score_target(vis_tokens, ir_tokens, branch_type=branch_type),
             'mask': hard_mask,
             'routing_mask': routing_mask.squeeze(-1),
             'topk_index': topk_index,
             'topk_value': topk_value,
         }
+        if self.return_score_target:
+            aux['score_target'] = self._build_score_target(vis_tokens, ir_tokens, branch_type=branch_type)
         return fused_map, aux
 
     def forward(self, vis_feat: torch.Tensor, ir_feat: torch.Tensor, frequency_intent: torch.Tensor = None):
@@ -112,8 +114,6 @@ class TGSFF(nn.Module):
             'frequency_intent': frequency_intent,
             'amp_score': amp_aux['score'],
             'phase_score': phase_aux['score'],
-            'amp_score_target': amp_aux['score_target'],
-            'phase_score_target': phase_aux['score_target'],
             'amp_mask': amp_aux['mask'],
             'phase_mask': phase_aux['mask'],
             'amp_routing_mask': amp_aux['routing_mask'],
@@ -123,6 +123,9 @@ class TGSFF(nn.Module):
             'amp_topk_value': amp_aux['topk_value'],
             'phase_topk_value': phase_aux['topk_value'],
         }
+        if self.return_score_target:
+            aux['amp_score_target'] = amp_aux['score_target']
+            aux['phase_score_target'] = phase_aux['score_target']
         return fused_feature, aux
 
 

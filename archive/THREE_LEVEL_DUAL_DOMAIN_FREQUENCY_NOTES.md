@@ -86,7 +86,7 @@ fused_image, _ = decoder(decoder_skip, fused_spa, fused_freq, text_intent=freq_a
 
 ## 5. Loss 兼容
 
-`TokenRoutingRankingLoss` 已兼容多尺度 score。若 `amp_score / phase_score` 是 list，会逐层计算 ranking loss 后求平均。
+Legacy routing supervision had multi-scale score support. 若 `amp_score / phase_score` 是 list，会逐层计算 ranking loss 后求平均。
 
 ## 6. 验证
 
