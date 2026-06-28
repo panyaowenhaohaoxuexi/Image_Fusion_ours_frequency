@@ -117,7 +117,7 @@ def main():
     criteria_ssim = SimpleSSIMLoss(window_size=11).to(device)
     criteria_freq = FrequencyConsistencyLoss(low_weight=1.0, high_weight=1.0).to(device)
 
-    num_epochs = 70
+    num_epochs = 50
     lr = 1e-4
     weight_decay = 0.0
     batch_size = 8
