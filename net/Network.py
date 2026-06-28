@@ -4,7 +4,7 @@ from net.encoder.simple_encoder import SimpleSharedEncoder
 from net.fusion.text_conditioned_spatial_fusion import TGCSF as _TGCSF
 from net.decoder.simple_decoder import SimpleDecoder
 from net.intent import DualDomainTextIntentGenerator
-from net.dda import FSRC as _FSRC, FrequencySpatialResidualCoupling as _FrequencySpatialResidualCoupling
+from net.FSRC import FSRC as _FSRC, FrequencySpatialResidualCoupling as _FrequencySpatialResidualCoupling
 from net.frequency_fusion import FrequencyPyramidAdapter
 
 
