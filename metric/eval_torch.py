@@ -3,6 +3,7 @@ from Metric_torch import *
 from natsort import natsorted
 from tqdm import tqdm
 import os
+import numpy as np
 import torch
 import warnings
 from openpyxl import Workbook, load_workbook
@@ -10,6 +11,8 @@ from openpyxl.utils import get_column_letter
 
 warnings.filterwarnings("ignore")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def write_excel(excel_name='metric.xlsx', worksheet_name='VIF', column_index=0, data=None):
@@ -47,7 +50,6 @@ def evaluation_one(ir_name, vi_name, f_name):
     vi_img_int = np.array(vi_img).astype(np.int32)
     vi_img_double = np.array(vi_img).astype(np.float32)
 
-
     CE = CE_function(ir_img_tensor, vi_img_tensor, f_img_tensor)
     NMI = NMI_function(ir_img_int, vi_img_int, f_img_int, gray_level=256)
     QNCIE = QNCIE_function(ir_img_tensor, vi_img_tensor, f_img_tensor)
@@ -73,45 +75,59 @@ def evaluation_one(ir_name, vi_name, f_name):
     return CE, NMI, QNCIE, TE, EI, Qy, Qcb, EN, MI, SF, AG, SD, CC, SCD, VIF, MSE, PSNR, Qabf, Nabf, SSIM, MS_SSIM
 
 
-if __name__ == '__main__':
-    if __name__ == '__main__':
-        with_mean = True
-        config = {
-            'dataroot': r'/root/Image_Fusion_ours_frequency_v1/test_img/',  # Change to your local infrared and visible images path
-            'results_root': r'/root/Image_Fusion_ours_frequency_v1/test_result/',  # Change to your local fusion images path  -fusion_result
-            'dataset': r'MSRS_v1',  # Specify the dataset name
-            'save_dir': r'/root/Image_Fusion_ours_frequency_v1/test_result/MSRS_v1_xlsx'  # Directory for saving metrics
-        }
+def resolve_fusion_path(fusion_dir, source_filename):
+    exact_path = os.path.join(fusion_dir, source_filename)
+    if os.path.exists(exact_path):
+        return exact_path
 
-        ir_dir = os.path.join(config['dataroot'], config['dataset'], 'ir')  # Infrared images directory
-        vi_dir = os.path.join(config['dataroot'], config['dataset'], 'vi')  # Visible images directory
-        f_dir = os.path.join(config['results_root'], config['dataset'])  # Fusion images directory
-        os.makedirs(config['save_dir'], exist_ok=True)
-        filelist = natsorted(os.listdir(ir_dir))[:360]
-        metric_save_name = os.path.join(config['save_dir'], f'metric_{config["dataset"]}.xlsx')  # Metrics file name
+    stem, _ = os.path.splitext(source_filename)
+    for ext in ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'):
+        candidate = os.path.join(fusion_dir, stem + ext)
+        if os.path.exists(candidate):
+            return candidate
+    return exact_path
 
-        # Change to the directory name of the fusion images you want to evaluate
-        # Method_list = [
-        #     'RFN-Nest','TarDAL','ReCoNet','CMTFusion','LRRNet','MPCFusion','FISCNet'
-        # ]
 
-        
-        # 将原有的 Method_list 注释掉，改为只包含一个空字符串的列表
-        Method_list = ['.']  # 这里写什么，Excel表头就会显示什么
+def to_excel_values(values):
+    return [
+        x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x
+        for x in values
+    ]
 
-        # 确保索引从 0 开始
-        start_index = 0
-        
-        
-        
-        # Method_list = [
-        #     'Ours','SDNet','RFN-Nest','TarDAL','ReCoNet','CMTFusion','CDDFuse','IGNet','LRRNet','MPCFusion','SFDFusion',
-        #     'FISCNet'
-        # ]
 
-        # Starting index for the method 'BDLFusion'
-        # start_index = Method_list.index('RFN-Nest')
-        
+def main():
+    with_mean = True
+    config = {
+        'dataroot': os.path.join(PROJECT_ROOT, 'test_img'),
+        'results_root': os.path.join(PROJECT_ROOT, 'test_result'),
+        'dataset': 'MSRS_v10',
+        'fusion_subdir': 'gray',
+        'save_dir': os.path.join(PROJECT_ROOT, 'test_result', 'MSRS_v10_xlsx'),
+        'max_images': None,
+    }
+
+    ir_dir = os.path.join(config['dataroot'], config['dataset'], 'ir')
+    vi_dir = os.path.join(config['dataroot'], config['dataset'], 'vi')
+    f_dir = os.path.join(config['results_root'], config['dataset'], config['fusion_subdir'])
+    os.makedirs(config['save_dir'], exist_ok=True)
+
+    if not os.path.isdir(ir_dir):
+        raise FileNotFoundError(f'IR folder not found: {ir_dir}')
+    if not os.path.isdir(vi_dir):
+        raise FileNotFoundError(f'VI folder not found: {vi_dir}')
+    if not os.path.isdir(f_dir):
+        raise FileNotFoundError(f'Fusion gray folder not found: {f_dir}')
+
+    filelist = natsorted(os.listdir(ir_dir))
+    if config['max_images'] is not None:
+        filelist = filelist[:config['max_images']]
+
+    metric_save_name = os.path.join(config['save_dir'], f'metric_{config["dataset"]}_{config["fusion_subdir"]}.xlsx')
+
+    # The current test.py saves objective-metric images under test_result/<dataset>/gray.
+    # Use one pseudo-method column to evaluate that folder directly.
+    Method_list = ['.']
+    start_index = 0
 
     for i, Method in enumerate(Method_list[start_index:], start=start_index):
         CE_list = []
@@ -138,10 +154,11 @@ if __name__ == '__main__':
         filename_list = ['']
         sub_f_dir = os.path.join(f_dir, Method)
         eval_bar = tqdm(filelist)
+
         for _, item in enumerate(eval_bar):
             ir_name = os.path.join(ir_dir, item)
             vi_name = os.path.join(vi_dir, item)
-            f_name = os.path.join(sub_f_dir, item)
+            f_name = resolve_fusion_path(sub_f_dir, item)
 
             if os.path.exists(f_name):
                 print(ir_name, vi_name, f_name)
@@ -169,51 +186,35 @@ if __name__ == '__main__':
                 MS_SSIM_list.append(MS_SSIM)
                 filename_list.append(item)
                 eval_bar.set_description("{} | {}".format(Method, item))
+            else:
+                print(f'Skip {item}: fusion image not found at {f_name}')
+
+        if not CE_list:
+            raise RuntimeError(f'No fusion images were evaluated in: {sub_f_dir}')
 
         if with_mean:
-            CE_tensor = torch.tensor(CE_list).mean().item()
-            CE_list.append(CE_tensor)
-            NMI_tensor = torch.tensor(NMI_list).mean().item()
-            NMI_list.append(NMI_tensor)
-            QNCIE_tensor = torch.tensor(QNCIE_list).mean().item()
-            QNCIE_list.append(QNCIE_tensor)
-            TE_tensor = torch.tensor(TE_list).mean().item()
-            TE_list.append(TE_tensor)
-            EI_tensor = torch.tensor(EI_list).mean().item()
-            EI_list.append(EI_tensor)
-            Qy_tensor = torch.tensor(Qy_list).mean().item()
-            Qy_list.append(Qy_tensor)
-            Qcb_tensor = torch.tensor(Qcb_list).mean().item()
-            Qcb_list.append(Qcb_tensor)
-            EN_tensor = torch.tensor(EN_list).mean().item()
-            EN_list.append(EN_tensor)
-            MI_tensor = torch.tensor(MI_list).mean().item()
-            MI_list.append(MI_tensor)
-            SF_tensor = torch.tensor(SF_list).mean().item()
-            SF_list.append(SF_tensor)
-            AG_tensor = torch.tensor(AG_list).mean().item()
-            AG_list.append(AG_tensor)
-            SD_tensor = torch.tensor(SD_list).mean().item()
-            SD_list.append(SD_tensor)
-            CC_tensor = torch.tensor(CC_list).mean().item()
-            CC_list.append(CC_tensor)
-            SCD_tensor = torch.tensor(SCD_list).mean().item()
-            SCD_list.append(SCD_tensor)
-            VIF_tensor = torch.tensor(VIF_list).mean().item()
-            VIF_list.append(VIF_tensor)
-            MSE_tensor = torch.tensor(MSE_list).mean().item()
-            MSE_list.append(MSE_tensor)
-            PSNR_tensor = torch.tensor(PSNR_list).mean().item()
-            PSNR_list.append(PSNR_tensor)
+            CE_list.append(torch.tensor(CE_list).mean().item())
+            NMI_list.append(torch.tensor(NMI_list).mean().item())
+            QNCIE_list.append(torch.tensor(QNCIE_list).mean().item())
+            TE_list.append(torch.tensor(TE_list).mean().item())
+            EI_list.append(torch.tensor(EI_list).mean().item())
+            Qy_list.append(torch.tensor(Qy_list).mean().item())
+            Qcb_list.append(torch.tensor(Qcb_list).mean().item())
+            EN_list.append(torch.tensor(EN_list).mean().item())
+            MI_list.append(torch.tensor(MI_list).mean().item())
+            SF_list.append(torch.tensor(SF_list).mean().item())
+            AG_list.append(torch.tensor(AG_list).mean().item())
+            SD_list.append(torch.tensor(SD_list).mean().item())
+            CC_list.append(torch.tensor(CC_list).mean().item())
+            SCD_list.append(torch.tensor(SCD_list).mean().item())
+            VIF_list.append(torch.tensor(VIF_list).mean().item())
+            MSE_list.append(torch.tensor(MSE_list).mean().item())
+            PSNR_list.append(torch.tensor(PSNR_list).mean().item())
             Qabf_list.append(np.mean(Qabf_list))
-            Nabf_tensor = torch.tensor(Nabf_list).mean().item()
-            Nabf_list.append(Nabf_tensor)
-            SSIM_tensor = torch.tensor(SSIM_list).mean().item()
-            SSIM_list.append(SSIM_tensor)
-            MS_SSIM_tensor = torch.tensor(MS_SSIM_list).mean().item()
-            MS_SSIM_list.append(MS_SSIM_tensor)
+            Nabf_list.append(torch.tensor(Nabf_list).mean().item())
+            SSIM_list.append(torch.tensor(SSIM_list).mean().item())
+            MS_SSIM_list.append(torch.tensor(MS_SSIM_list).mean().item())
             filename_list.append('mean')
-
 
         CE_list.insert(0, '{}'.format(Method))
         NMI_list.insert(0, '{}'.format(Method))
@@ -238,86 +239,40 @@ if __name__ == '__main__':
         MS_SSIM_list.insert(0, '{}'.format(Method))
 
         if i == start_index:
-            write_excel(metric_save_name, 'CE', 0, filename_list)
-            write_excel(metric_save_name, 'NMI', 0, filename_list)
-            write_excel(metric_save_name, 'QNCIE', 0, filename_list)
-            write_excel(metric_save_name, 'TE', 0, filename_list)
-            write_excel(metric_save_name, 'EI', 0, filename_list)
-            write_excel(metric_save_name, 'Qy', 0, filename_list)
-            write_excel(metric_save_name, 'Qcb', 0, filename_list)
-            write_excel(metric_save_name, 'EN', 0, filename_list)
-            write_excel(metric_save_name, "MI", 0, filename_list)
-            write_excel(metric_save_name, "SF", 0, filename_list)
-            write_excel(metric_save_name, "AG", 0, filename_list)
-            write_excel(metric_save_name, "SD", 0, filename_list)
-            write_excel(metric_save_name, "CC", 0, filename_list)
-            write_excel(metric_save_name, "SCD", 0, filename_list)
-            write_excel(metric_save_name, "VIF", 0, filename_list)
-            write_excel(metric_save_name, "MSE", 0, filename_list)
-            write_excel(metric_save_name, "PSNR", 0, filename_list)
-            write_excel(metric_save_name, "Qabf", 0, filename_list)
-            write_excel(metric_save_name, "Nabf", 0, filename_list)
-            write_excel(metric_save_name, "SSIM", 0, filename_list)
-            write_excel(metric_save_name, "MS_SSIM", 0, filename_list)
+            for sheet_name in [
+                'CE', 'NMI', 'QNCIE', 'TE', 'EI', 'Qy', 'Qcb', 'EN', 'MI', 'SF', 'AG', 'SD',
+                'CC', 'SCD', 'VIF', 'MSE', 'PSNR', 'Qabf', 'Nabf', 'SSIM', 'MS_SSIM'
+            ]:
+                write_excel(metric_save_name, sheet_name, 0, filename_list)
 
-        write_excel(metric_save_name, 'CE', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in CE_list])
-        write_excel(metric_save_name, 'NMI', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in NMI_list])
-        write_excel(metric_save_name, 'QNCIE', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in QNCIE_list])
-        write_excel(metric_save_name, 'TE', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in TE_list])
-        write_excel(metric_save_name, 'EI', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in EI_list])
-        write_excel(metric_save_name, 'Qy', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in Qy_list])
-        write_excel(metric_save_name, 'Qcb', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in Qcb_list])
-        write_excel(metric_save_name, 'EN', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in EN_list])
-        write_excel(metric_save_name, 'MI', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in MI_list])
-        write_excel(metric_save_name, 'SF', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in SF_list])
-        write_excel(metric_save_name, 'AG', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in AG_list])
-        write_excel(metric_save_name, 'SD', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in SD_list])
-        write_excel(metric_save_name, 'CC', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in CC_list])
-        write_excel(metric_save_name, 'SCD', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in SCD_list])
-        write_excel(metric_save_name, 'VIF', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in VIF_list])
-        write_excel(metric_save_name, 'MSE', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in MSE_list])
-        write_excel(metric_save_name, 'PSNR', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in PSNR_list])
-        write_excel(metric_save_name, 'Qabf', i + 1, Qabf_list)
-        write_excel(metric_save_name, 'Nabf', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in Nabf_list])
-        write_excel(metric_save_name, 'SSIM', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in SSIM_list])
-        write_excel(metric_save_name, 'MS_SSIM', i + 1,
-                    [x.item() if isinstance(x, torch.Tensor) else float(x) if isinstance(x, (int, float)) else x for x
-                     in MS_SSIM_list])
+        metric_columns = [
+            ('CE', CE_list),
+            ('NMI', NMI_list),
+            ('QNCIE', QNCIE_list),
+            ('TE', TE_list),
+            ('EI', EI_list),
+            ('Qy', Qy_list),
+            ('Qcb', Qcb_list),
+            ('EN', EN_list),
+            ('MI', MI_list),
+            ('SF', SF_list),
+            ('AG', AG_list),
+            ('SD', SD_list),
+            ('CC', CC_list),
+            ('SCD', SCD_list),
+            ('VIF', VIF_list),
+            ('MSE', MSE_list),
+            ('PSNR', PSNR_list),
+            ('Qabf', Qabf_list),
+            ('Nabf', Nabf_list),
+            ('SSIM', SSIM_list),
+            ('MS_SSIM', MS_SSIM_list),
+        ]
+        for sheet_name, values in metric_columns:
+            write_excel(metric_save_name, sheet_name, i + 1, to_excel_values(values))
+
+    print(f'Metrics saved to: {metric_save_name}')
+
+
+if __name__ == '__main__':
+    main()
