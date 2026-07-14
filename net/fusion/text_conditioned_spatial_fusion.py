@@ -32,6 +32,22 @@ class SemanticAffineModulation(nn.Module):
         )
         self.gamma_proj = nn.Conv2d(channels, channels, 1, 1, 0)
         self.beta_proj = nn.Conv2d(channels, channels, 1, 1, 0)
+        self.mod_scale = nn.Parameter(torch.tensor(0.1))
+
+        final_linear = None
+        for module in reversed(list(self.mlp.modules())):
+            if isinstance(module, nn.Linear):
+                final_linear = module
+                break
+        if final_linear is None:
+            raise RuntimeError("SemanticAffineModulation MLP has no Linear layer")
+        nn.init.zeros_(final_linear.weight)
+        if final_linear.bias is not None:
+            nn.init.zeros_(final_linear.bias)
+        if self.gamma_proj.bias is not None:
+            nn.init.zeros_(self.gamma_proj.bias)
+        if self.beta_proj.bias is not None:
+            nn.init.zeros_(self.beta_proj.bias)
 
     def forward(self, feat: torch.Tensor, z_fus: torch.Tensor) -> torch.Tensor:
         b, c, h, w = feat.shape
@@ -40,7 +56,12 @@ class SemanticAffineModulation(nn.Module):
         beta = beta.view(b, c, 1, 1).expand(-1, -1, h, w)
         gamma = self.gamma_proj(gamma)
         beta = self.beta_proj(beta)
-        return gamma * self.norm(feat) + beta
+        gamma = torch.tanh(gamma)
+        beta = torch.tanh(beta)
+        norm_feat = self.norm(feat)
+        semantic_delta = gamma * norm_feat + beta
+        scale = torch.tanh(self.mod_scale)
+        return feat + scale * semantic_delta
 
 
 class PositionAdaptiveWeightGate(nn.Module):

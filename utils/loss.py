@@ -105,15 +105,15 @@ class FrequencyConsistencyLoss(nn.Module):
         ir_saliency = torch.sigmoid(self._standardize(ir))
         diff_saliency = torch.sigmoid(self._standardize(diff))
 
-        enhanced = (
-            ir_saliency * (1.0 + diff_saliency)
-            + diff_saliency * (1.0 + ir_saliency)
+        response = (
+            ir_saliency * (1.0 - diff_saliency)
+            + diff_saliency * (1.0 - ir_saliency)
         ) * 0.5
 
-        mean = enhanced.mean(dim=(-2, -1), keepdim=True)
-        std = enhanced.std(dim=(-2, -1), keepdim=True, unbiased=False).clamp_min(self.eps)
+        mean = response.mean(dim=(-2, -1), keepdim=True)
+        std = response.std(dim=(-2, -1), keepdim=True, unbiased=False)
         threshold = mean + std
-        mask = (enhanced > threshold).float()
+        mask = (response > threshold).to(response.dtype)
 
         if self.detach_mask:
             mask = mask.detach()
@@ -147,8 +147,8 @@ class FrequencyConsistencyLoss(nn.Module):
 
         neg_ir_cross = self._fft_l1(f_ir_region, ir_mismatch)
         neg_vis_cross = self._fft_l1(f_ir_region, vis_mismatch)
-        neg_bg_ir = self._fft_l1(f_vis_region, ir_mismatch)
-        neg_bg_vis = self._fft_l1(f_vis_region, vis_mismatch)
+        neg_bg_ir = self._fft_l1(f_vis_region, ir_region)
+        neg_bg_vis = self._fft_l1(f_vis_region, vis_region)
         neg_loss = neg_ir_cross + neg_vis_cross + neg_bg_ir + neg_bg_vis
 
         denom = (self.neg_weight * neg_loss).clamp_min(self.eps)
