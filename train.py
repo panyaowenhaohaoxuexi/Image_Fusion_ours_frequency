@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+
 from config import (
     CHECKPOINT_TAG,
     CLIP_DOWNLOAD_ROOT,
