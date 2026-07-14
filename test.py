@@ -1,114 +1,86 @@
 # -*- coding: utf-8 -*-
+import logging
 import os
+import warnings
+
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-import warnings
-import logging
 
+from config import (
+    CHECKPOINT_TAG,
+    CLIP_DOWNLOAD_ROOT,
+    CLIP_MODEL_NAME,
+    MODEL_DIRECTORY,
+    MODEL_VERSION,
+    USE_CLIP_IMAGE_QUERY,
+)
 from net.Network import (
-    SharedEncoder,
-    FusionDecoder,
-    TextConditionedSpatialFusion,
     DualDomainTextIntentGenerator,
+    DualStreamIntentMLP,
     FSRC,
     FrequencyPyramidAdapter,
+    FusionDecoder,
+    SharedEncoder,
+    TextConditionedSpatialFusion,
 )
 from net.frequency_fusion import TGSFF
+from utils.clip_preprocess import preprocess_clip_rgb
 from utils.img_read_save import img_save
+
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.CRITICAL)
-
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-
-ckpt_path = r'/root/Image_Fusion_ours_frequency_v10/models/TextIntentDualDomainFusion_latest.pth'
-
-CLIP_MODEL_NAME = r'/root/Image_Fusion_ours_frequency_v10/weight/clip/ViT-B-32.pt'
-CLIP_DOWNLOAD_ROOT = r'/root/Image_Fusion_ours_frequency_v10/weight/clip'
-USE_LEARNABLE_PROMPT_EMBEDDING = False
-
-if not os.path.isfile(CLIP_MODEL_NAME):
-    raise FileNotFoundError(f'CLIP checkpoint not found: {CLIP_MODEL_NAME}')
+ckpt_path = os.path.join(MODEL_DIRECTORY, f'{CHECKPOINT_TAG}_TextIntentDualDomainFusion_latest.pth')
 
 
-def build_model(device, use_learnable_prompt_embedding: bool = USE_LEARNABLE_PROMPT_EMBEDDING):
-    encoder = nn.DataParallel(
-        SharedEncoder(
-            inp_channels=1,
-            feature_dim=64,
-            inner_dim=24,
-            num_blocks=1,
-            num_heads=1,
-            ffn_expansion_factor=2.0,
+def build_model(device):
+    encoder = nn.DataParallel(SharedEncoder(
+        inp_channels=1, feature_dim=64, inner_dim=24, num_blocks=1, num_heads=1, ffn_expansion_factor=2.0,
+    )).to(device)
+    if USE_CLIP_IMAGE_QUERY:
+        intent_core = DualDomainTextIntentGenerator(
+            intent_dim=64, clip_model_name=CLIP_MODEL_NAME,
+            clip_download_root=CLIP_DOWNLOAD_ROOT, clip_device=str(device),
         )
-    ).to(device)
-
-    intent_generator = nn.DataParallel(
-        DualDomainTextIntentGenerator(
-            channels=64,
-            intent_dim=64,
-            hidden_dim=256,
-            clip_model_name=CLIP_MODEL_NAME,
-            clip_download_root=CLIP_DOWNLOAD_ROOT,
-            use_clip_prompt_bank=True,
-            use_learnable_prompt_embedding=use_learnable_prompt_embedding,
+    else:
+        intent_core = DualStreamIntentMLP(
+            channels=64, intent_dim=64, hidden_dim=256, clip_model_name=CLIP_MODEL_NAME,
+            clip_download_root=CLIP_DOWNLOAD_ROOT, clip_device=str(device),
         )
-    ).to(device)
-
-    frequency_fusion = nn.DataParallel(
-        TGSFF(
-            in_channels=64,
-            patch_size=4,
-            amp_topk_ratio=0.30,
-            phase_topk_ratio=0.35,
-            token_embed_dim=128,
-            num_heads=4,
-            return_aux=True,
-            routing_temperature=0.25,
-        )
-    ).to(device)
-
+    intent_generator = nn.DataParallel(intent_core).to(device)
+    frequency_fusion = nn.DataParallel(TGSFF(
+        in_channels=64, patch_size=4, amp_topk_ratio=0.30, phase_topk_ratio=0.35,
+        token_embed_dim=128, num_heads=4, return_aux=True, routing_temperature=0.25,
+    )).to(device)
     frequency_pyramid_adapter = nn.DataParallel(FrequencyPyramidAdapter(channels=64)).to(device)
-
-    spatial_fusion = nn.DataParallel(
-        TextConditionedSpatialFusion(
-            channels=64,
-            intent_dim=64,
-            num_heads=4,
-            ffn_expansion_factor=2.0,
-            init_res_scale=0.05,
-            use_freq_context=False,
-        )
-    ).to(device)
-
+    spatial_fusion = nn.DataParallel(TextConditionedSpatialFusion(
+        channels=64, intent_dim=64, num_heads=4, ffn_expansion_factor=2.0,
+        init_res_scale=0.05, use_freq_context=False,
+    )).to(device)
     fsrc_l1 = nn.DataParallel(FSRC(channels=64)).to(device)
     fsrc_l2 = nn.DataParallel(FSRC(channels=64)).to(device)
     fsrc_l3 = nn.DataParallel(FSRC(channels=64)).to(device)
+    fusion_decoder = nn.DataParallel(FusionDecoder(
+        channels=64, out_channels=1, inner_dim=24, num_blocks=1, num_heads=1, ffn_expansion_factor=2.0,
+    )).to(device)
+    return encoder, intent_generator, frequency_fusion, frequency_pyramid_adapter, spatial_fusion, fsrc_l1, fsrc_l2, fsrc_l3, fusion_decoder
 
-    fusion_decoder = nn.DataParallel(
-        FusionDecoder(
-            channels=64,
-            out_channels=1,
-            inner_dim=24,
-            num_blocks=1,
-            num_heads=1,
-            ffn_expansion_factor=2.0,
-        )
-    ).to(device)
 
-    return (
-        encoder,
-        intent_generator,
-        frequency_fusion,
-        frequency_pyramid_adapter,
-        spatial_fusion,
-        fsrc_l1,
-        fsrc_l2,
-        fsrc_l3,
-        fusion_decoder,
-    )
+def unwrap(module):
+    return module.module if isinstance(module, nn.DataParallel) else module
+
+
+def validate_checkpoint_metadata(checkpoint, intent_generator):
+    expected_type = type(unwrap(intent_generator)).__name__
+    if checkpoint.get('model_version') != MODEL_VERSION:
+        raise RuntimeError('Checkpoint model version mismatch.')
+    if checkpoint.get('use_clip_image_query') != USE_CLIP_IMAGE_QUERY:
+        raise RuntimeError('Checkpoint query variant mismatch.')
+    if checkpoint.get('intent_generator_type') != expected_type:
+        raise RuntimeError('Checkpoint intent generator type mismatch.')
 
 
 def _load_state(module, checkpoint, key, strict=True):
@@ -118,150 +90,72 @@ def _load_state(module, checkpoint, key, strict=True):
 
 
 def normalize_to_uint8(tensor):
-    tensor = tensor.detach().clamp(0.0, 1.0)
-    image = np.squeeze((tensor * 255.0).cpu().numpy())
-    image = np.round(image).astype(np.uint8)
-    return image
+    return np.round(np.squeeze((tensor.detach().clamp(0.0, 1.0) * 255.0).cpu().numpy())).astype(np.uint8)
 
 
 def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    (
-        encoder,
-        intent_generator,
-        frequency_fusion,
-        frequency_pyramid_adapter,
-        spatial_fusion,
-        fsrc_l1,
-        fsrc_l2,
-        fsrc_l3,
-        fusion_decoder,
-    ) = build_model(device)
-
+    if not os.path.isfile(CLIP_MODEL_NAME):
+        raise FileNotFoundError(f'CLIP checkpoint not found: {CLIP_MODEL_NAME}')
+    modules = build_model(device)
+    (encoder, intent_generator, frequency_fusion, frequency_pyramid_adapter, spatial_fusion,
+     fsrc_l1, fsrc_l2, fsrc_l3, fusion_decoder) = modules
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f'Checkpoint not found: {ckpt_path}')
-
     checkpoint = torch.load(ckpt_path, map_location=device)
-
-    _load_state(encoder, checkpoint, 'shared_encoder', strict=True)
-    _load_state(intent_generator, checkpoint, 'intent_generator', strict=True)
-    _load_state(frequency_fusion, checkpoint, 'frequency_fusion', strict=True)
-    _load_state(frequency_pyramid_adapter, checkpoint, 'frequency_pyramid_adapter', strict=True)
-    _load_state(spatial_fusion, checkpoint, 'spatial_fusion', strict=True)
-    _load_state(fsrc_l1, checkpoint, 'fsrc_l1', strict=True)
-    _load_state(fsrc_l2, checkpoint, 'fsrc_l2', strict=True)
-    _load_state(fsrc_l3, checkpoint, 'fsrc_l3', strict=True)
-    _load_state(fusion_decoder, checkpoint, 'fusion_decoder', strict=True)
-
-    for module in [
-        encoder,
-        intent_generator,
-        frequency_fusion,
-        frequency_pyramid_adapter,
-        spatial_fusion,
-        fsrc_l1,
-        fsrc_l2,
-        fsrc_l3,
-        fusion_decoder,
-    ]:
+    validate_checkpoint_metadata(checkpoint, intent_generator)
+    keys = ('shared_encoder', 'intent_generator', 'frequency_fusion', 'frequency_pyramid_adapter',
+            'spatial_fusion', 'fsrc_l1', 'fsrc_l2', 'fsrc_l3', 'fusion_decoder')
+    for module, key in zip(modules, keys):
+        _load_state(module, checkpoint, key, strict=True)
+    for module in modules:
         module.eval()
 
     for dataset_name in ['MSRS_v10']:
-        print('\n' * 2 + '=' * 80)
-        print('The test result of ' + dataset_name + ' :')
-
         test_folder = os.path.join('./test_img/', dataset_name)
         test_out_folder = os.path.join('./test_result', dataset_name)
-
-        gray_out_folder = os.path.join(test_out_folder, 'gray')
-        color_out_folder = os.path.join(test_out_folder, 'color')
-
+        gray_out_folder, color_out_folder = os.path.join(test_out_folder, 'gray'), os.path.join(test_out_folder, 'color')
         os.makedirs(gray_out_folder, exist_ok=True)
         os.makedirs(color_out_folder, exist_ok=True)
-
-        ir_folder = os.path.join(test_folder, 'ir')
-        vi_folder = os.path.join(test_folder, 'vi')
-
-        if not os.path.isdir(ir_folder):
-            raise FileNotFoundError(f'IR folder not found: {ir_folder}')
-        if not os.path.isdir(vi_folder):
-            raise FileNotFoundError(f'VI folder not found: {vi_folder}')
+        ir_folder, vi_folder = os.path.join(test_folder, 'ir'), os.path.join(test_folder, 'vi')
+        if not os.path.isdir(ir_folder) or not os.path.isdir(vi_folder):
+            raise FileNotFoundError(f'Test folders not found: {ir_folder}, {vi_folder}')
 
         with torch.no_grad():
             for img_name in sorted(os.listdir(ir_folder)):
-                ir_path = os.path.join(ir_folder, img_name)
-                vi_path = os.path.join(vi_folder, img_name)
-
-                if not os.path.isfile(vi_path):
-                    print(f'Skip {img_name}: visible image not found.')
-                    continue
-
+                ir_path, vi_path = os.path.join(ir_folder, img_name), os.path.join(vi_folder, img_name)
                 data_ir_np = cv2.imread(ir_path, cv2.IMREAD_GRAYSCALE)
                 data_vis_bgr = cv2.imread(vi_path, cv2.IMREAD_COLOR)
-
                 if data_ir_np is None or data_vis_bgr is None:
                     print(f'Skip {img_name}: image read failed.')
                     continue
-
-                h, w = data_vis_bgr.shape[:2]
-                if data_ir_np.shape[:2] != (h, w):
-                    data_ir_np = cv2.resize(data_ir_np, (w, h), interpolation=cv2.INTER_LINEAR)
-
-                data_vis_ycrcb = cv2.cvtColor(data_vis_bgr, cv2.COLOR_BGR2YCrCb)
-                data_vis_y, data_vis_cr, data_vis_cb = cv2.split(data_vis_ycrcb)
-
-                data_ir = torch.from_numpy(
-                    data_ir_np[np.newaxis, np.newaxis, ...].astype(np.float32) / 255.0
-                ).to(device)
-
-                data_vis = torch.from_numpy(
-                    data_vis_y[np.newaxis, np.newaxis, ...].astype(np.float32) / 255.0
-                ).to(device)
+                height, width = data_vis_bgr.shape[:2]
+                if data_ir_np.shape[:2] != (height, width):
+                    data_ir_np = cv2.resize(data_ir_np, (width, height), interpolation=cv2.INTER_LINEAR)
+                data_vis_rgb_raw = torch.from_numpy(
+                    cv2.cvtColor(data_vis_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                ).permute(2, 0, 1).unsqueeze(0).to(device)
+                data_vis_clip = preprocess_clip_rgb(data_vis_rgb_raw)
+                data_vis_y, data_vis_cr, data_vis_cb = cv2.split(cv2.cvtColor(data_vis_bgr, cv2.COLOR_BGR2YCrCb))
+                data_ir = torch.from_numpy(data_ir_np[None, None].astype(np.float32) / 255.0).to(device)
+                data_vis = torch.from_numpy(data_vis_y[None, None].astype(np.float32) / 255.0).to(device)
 
                 vis_spa, vis_freq, _ = encoder(data_vis)
                 ir_spa, ir_freq, _ = encoder(data_ir)
-
-                I_deg, I_fus, _ = intent_generator(vis_spa, ir_spa, vis_freq, ir_freq)
-
-                fused_freq, _ = frequency_fusion(vis_freq, ir_freq, frequency_intent=I_deg)
-
-                _spatial_out, spatial_pyramid, _ = spatial_fusion(
-                    vis_spa,
-                    ir_spa,
-                    I_fus,
-                    return_aux=True,
-                    return_pyramid=True,
-                )
-
+                i_deg, i_fus, _ = intent_generator(data_vis_clip, vis_spa, ir_spa, vis_freq, ir_freq)
+                fused_freq, _ = frequency_fusion(vis_freq, ir_freq, frequency_intent=i_deg)
+                _, spatial_pyramid, _ = spatial_fusion(vis_spa, ir_spa, i_fus, return_aux=True, return_pyramid=True)
                 freq_pyramid = frequency_pyramid_adapter(fused_freq, target_pyramid=spatial_pyramid)
-
-                D_L1, _ = fsrc_l1(freq_pyramid["l1"], spatial_pyramid["l1"])
-                D_L2, _ = fsrc_l2(freq_pyramid["l2"], spatial_pyramid["l2"])
-                D_L3, _ = fsrc_l3(freq_pyramid["l3"], spatial_pyramid["l3"])
-
-                data_fuse, _ = fusion_decoder(D_L1, D_L2, D_L3)
-
-                fi = normalize_to_uint8(data_fuse)
+                d_l1, _ = fsrc_l1(freq_pyramid['l1'], spatial_pyramid['l1'])
+                d_l2, _ = fsrc_l2(freq_pyramid['l2'], spatial_pyramid['l2'])
+                d_l3, _ = fsrc_l3(freq_pyramid['l3'], spatial_pyramid['l3'])
+                data_fuse, _ = fusion_decoder(d_l1, d_l2, d_l3)
+                fused_y = normalize_to_uint8(data_fuse)
                 save_name = os.path.splitext(img_name)[0]
-
-                img_save(fi, save_name, gray_out_folder)
-
-                ycrcb_fi = cv2.merge(
-                    (
-                        fi.astype(np.uint8),
-                        data_vis_cr.astype(np.uint8),
-                        data_vis_cb.astype(np.uint8),
-                    )
-                )
-                rgb_fi = cv2.cvtColor(ycrcb_fi, cv2.COLOR_YCrCb2RGB)
-                img_save(rgb_fi, save_name, color_out_folder)
-
+                img_save(fused_y, save_name, gray_out_folder)
+                rgb_fusion = cv2.cvtColor(cv2.merge((fused_y, data_vis_cr, data_vis_cb)), cv2.COLOR_YCrCb2RGB)
+                img_save(rgb_fusion, save_name, color_out_folder)
                 print(f'Saved: {img_name}')
-
-        print(f'Finished testing {dataset_name}.')
-        print(f'Gray results saved to: {gray_out_folder}')
-        print(f'Color results saved to: {color_out_folder}')
 
 
 if __name__ == '__main__':

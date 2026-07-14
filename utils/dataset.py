@@ -19,5 +19,6 @@ class H5Dataset(Data.Dataset):
         key = self.keys[index]
         IR = np.array(h5f['ir_patchs'][key])
         VIS = np.array(h5f['vis_patchs'][key])
+        VIS_RGB_raw = np.array(h5f['vis_rgb_patchs'][key])
         h5f.close()
-        return torch.Tensor(VIS), torch.Tensor(IR)
+        return torch.from_numpy(VIS), torch.from_numpy(IR), torch.from_numpy(VIS_RGB_raw)

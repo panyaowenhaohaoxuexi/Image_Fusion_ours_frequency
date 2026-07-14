@@ -3,113 +3,96 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    import clip  # type: ignore
-except Exception:
-    clip = None
+import clip
 
 
-class FixedPromptBank(nn.Module):
-    """固定高层先验库。"""
+DEGRADATION_PROMPT_GROUPS = {
+    "low_light": [
+        "a low-light visible image",
+        "a dim nighttime scene with poor visibility",
+        "an underexposed scene with insufficient brightness",
+    ],
+    "blur": [
+        "a blurry visible image",
+        "a scene affected by motion blur",
+        "an out-of-focus scene with unclear details",
+    ],
+    "exposure": [
+        "an overexposed visible image",
+        "a scene with clipped bright highlights",
+        "a washed-out scene with excessive brightness",
+    ],
+    "structure": [
+        "an image with degraded structural contours",
+        "a scene with damaged or unclear boundaries",
+        "an image with corrupted geometric structures",
+    ],
+}
 
-    def __init__(self, prior_dim: int = 64):
+FUSION_PROMPT_GROUPS = {
+    "texture": [
+        "an image containing rich visible textures",
+        "a scene with detailed fine-scale textures",
+        "an image with abundant high-frequency texture details",
+    ],
+    "edge": [
+        "an image containing clear edge structures",
+        "a scene with sharp object boundaries",
+        "an image with distinct structural contours",
+    ],
+    "natural": [
+        "an image with a natural scene appearance",
+        "a scene with natural luminance and tone",
+        "an image with a visually natural intensity distribution",
+    ],
+    "contrast": [
+        "an image with clear local contrast",
+        "a scene with distinct regional intensity differences",
+        "an image with fine-grained contrast details",
+    ],
+    # TODO: add salient_ir_target through an independent non-CLIP statistics branch.
+}
+
+
+class CLIPTextPromptBank(nn.Module):
+    """Frozen category representatives in CLIP's native text embedding space."""
+
+    def __init__(self, clip_model, prompt_groups: dict):
         super().__init__()
-        self.prompt_names = [
-            'salient_targets',
-            'structural_contours',
-            'fine_textures',
-            'balanced_fusion',
-            'low_light_enhancement',
-        ]
-        bank = torch.zeros(len(self.prompt_names), prior_dim, dtype=torch.float32)
-        for i in range(len(self.prompt_names)):
-            bank[i, i::len(self.prompt_names)] = 1.0
-        bank = bank / (bank.norm(dim=1, keepdim=True) + 1e-6)
-        self.register_buffer('prompt_bank', bank)
+        clip_model.eval()
+        model_device = next(clip_model.parameters()).device
+        self.prompt_group_names = list(prompt_groups.keys())
+
+        group_vectors = []
+        with torch.no_grad():
+            for group_name in self.prompt_group_names:
+                tokens = clip.tokenize(prompt_groups[group_name]).to(model_device)
+                features = F.normalize(clip_model.encode_text(tokens).float(), dim=-1)
+                group_vectors.append(F.normalize(features.mean(dim=0), dim=0))
+        self.register_buffer("prompt_bank", torch.stack(group_vectors, dim=0))
 
     def forward(self) -> torch.Tensor:
         return self.prompt_bank
 
 
-class LearnablePromptBank(nn.Module):
-    """Ablation-only prompt bank with learnable vectors."""
+class CLIPImageQuery(nn.Module):
+    """The sole module that retains the frozen CLIP model."""
 
-    def __init__(self, num_prompts: int, prior_dim: int = 64):
+    def __init__(self, clip_model):
         super().__init__()
-        prompt_bank = torch.randn(num_prompts, prior_dim, dtype=torch.float32) * (prior_dim ** -0.5)
-        self.prompt_bank = nn.Parameter(F.normalize(prompt_bank, dim=-1))
-
-    def forward(self) -> torch.Tensor:
-        return F.normalize(self.prompt_bank, dim=-1)
-
-
-class CLIPTextPromptBank(nn.Module):
-    """冻结 CLIP text encoder，将固定 prompt 编码成可训练投影后的语义先验。"""
-
-    def __init__(self,
-                 prior_dim: int = 64,
-                 clip_model_name: str = 'ViT-B/32',
-                 prompt_texts=None,
-                 download_root: str = None,
-                 clip_device: str = None,
-                 allow_deterministic_fallback: bool = False):
-        super().__init__()
-        if clip is None and not allow_deterministic_fallback:
-            raise ImportError(
-                '未检测到 clip 库。请先安装 openai-clip，例如: pip install openai-clip==1.0.1'
-            )
-
-        if prompt_texts is None:
-            prompt_texts = [
-                'salient targets',
-                'structural contours',
-                'fine textures',
-                'balanced fusion',
-                'low light enhancement',
-            ]
-        self.prompt_texts = list(prompt_texts)
-        self.prompt_names = list(prompt_texts)
-
-        if clip is None or allow_deterministic_fallback:
-            bank = self._deterministic_bank(len(self.prompt_texts), prior_dim)
-            self.register_buffer('fallback_prompt_bank', bank)
-            self.proj = None
-            return
-
-        if clip_device is None:
-            clip_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-        clip_model, _ = clip.load(clip_model_name, device=clip_device, download_root=download_root)
-        clip_model.eval()
-        for p in clip_model.parameters():
-            p.requires_grad = False
         self.clip_model = clip_model
-        self.clip_device = clip_device
+        self.clip_model.eval()
+        for parameter in self.clip_model.parameters():
+            parameter.requires_grad = False
 
+    def train(self, mode: bool = True):
+        super().train(False)
+        self.clip_model.eval()
+        return self
+
+    def forward(self, vis_rgb_clip_ready: torch.Tensor) -> torch.Tensor:
+        parameter = next(self.clip_model.parameters())
+        image = vis_rgb_clip_ready.to(device=parameter.device, dtype=parameter.dtype)
         with torch.no_grad():
-            text_tokens = clip.tokenize(self.prompt_texts).to(clip_device)
-            text_features = clip_model.encode_text(text_tokens).float()
-            text_features = F.normalize(text_features, dim=-1)
-
-        self.register_buffer('clip_text_features', text_features.detach().cpu())
-        clip_dim = text_features.shape[-1]
-        self.proj = nn.Sequential(
-            nn.Linear(clip_dim, prior_dim),
-            nn.LayerNorm(prior_dim),
-        )
-
-    @staticmethod
-    def _deterministic_bank(num_prompts: int, prior_dim: int) -> torch.Tensor:
-        bank = torch.zeros(num_prompts, prior_dim, dtype=torch.float32)
-        for i in range(num_prompts):
-            bank[i, i::num_prompts] = 1.0
-        return F.normalize(bank, dim=-1)
-
-    def forward(self) -> torch.Tensor:
-        if self.proj is None:
-            return self.fallback_prompt_bank
-        clip_text_features = self.clip_text_features.to(self.proj[0].weight.device)
-        prompt_bank = self.proj(clip_text_features)
-        prompt_bank = F.normalize(prompt_bank, dim=-1)
-        return prompt_bank
-
+            features = self.clip_model.encode_image(image).float()
+        return F.normalize(features, dim=-1)
