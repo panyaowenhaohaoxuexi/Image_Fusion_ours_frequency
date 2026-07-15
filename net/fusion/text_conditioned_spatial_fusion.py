@@ -121,12 +121,13 @@ class PositionAdaptiveWeightGate(nn.Module):
             torch.abs(vis_gate_feat - ir_gate_feat),
             vis_gate_feat * ir_gate_feat,
         ], dim=1)
-        intent_map = self.intent_proj(spatial_intent).view(b, c, 1, 1).expand(-1, -1, h, w)
+        intent_vector = self.intent_proj(spatial_intent)
+        intent_logits = intent_vector.view(b, c, 1, 1)
+        intent_map = intent_logits.expand(-1, -1, h, w)
         avg_descriptor = F.adaptive_avg_pool2d(modality_feature, 1)
         max_descriptor = F.adaptive_max_pool2d(modality_feature, 1)
         channel_logits = self.channel_mlp(avg_descriptor) + self.channel_mlp(max_descriptor)
         spatial_logits = self.spatial_gate(torch.cat([modality_feature, intent_map], dim=1))
-        intent_logits = self.intent_proj(spatial_intent).view(b, c, 1, 1)
         gate_logits = channel_logits + spatial_logits + intent_logits
         weight_ir_channel = torch.sigmoid(gate_logits)
         weight_ir_image = torch.sigmoid(self.image_gate(gate_logits))

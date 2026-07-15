@@ -2,6 +2,7 @@ import math
 import unittest
 
 import torch
+import torch.nn.functional as F
 
 from net.FSRC import FSRC
 from net.decoder.simple_decoder import SimpleDecoder
@@ -17,14 +18,48 @@ def module_grad_norm(module: torch.nn.Module) -> torch.Tensor:
 
 
 class PositionAdaptiveWeightGateTests(unittest.TestCase):
+    @staticmethod
+    def _legacy_forward(gate, vis_feat, ir_feat, spatial_intent):
+        """Reference the pre-deduplication formula for numerical equivalence."""
+        b, c, h, w = vis_feat.shape
+        vis_gate_feat = gate.vis_gate_norm(vis_feat)
+        ir_gate_feat = gate.ir_gate_norm(ir_feat)
+        modality_feature = torch.cat([
+            vis_gate_feat,
+            ir_gate_feat,
+            torch.abs(vis_gate_feat - ir_gate_feat),
+            vis_gate_feat * ir_gate_feat,
+        ], dim=1)
+        intent_map = gate.intent_proj(spatial_intent).view(b, c, 1, 1).expand(-1, -1, h, w)
+        channel_logits = (
+            gate.channel_mlp(F.adaptive_avg_pool2d(modality_feature, 1))
+            + gate.channel_mlp(F.adaptive_max_pool2d(modality_feature, 1))
+        )
+        spatial_logits = gate.spatial_gate(torch.cat([modality_feature, intent_map], dim=1))
+        intent_logits = gate.intent_proj(spatial_intent).view(b, c, 1, 1)
+        gate_logits = channel_logits + spatial_logits + intent_logits
+        channel_gate = torch.sigmoid(gate_logits)
+        return channel_gate, torch.sigmoid(gate.image_gate(gate_logits))
+
     def test_channel_and_image_gates_have_independent_gradients(self):
         torch.manual_seed(7)
         gate = PositionAdaptiveWeightGate(channels=64, intent_dim=64)
+        gate.eval()
         vis = torch.randn(1, 64, 32, 32, requires_grad=True)
         ir = torch.randn(1, 64, 32, 32, requires_grad=True)
         intent = torch.randn(1, 64, requires_grad=True)
 
+        call_count = [0]
+        hook = gate.intent_proj.register_forward_hook(lambda *_: call_count.__setitem__(0, call_count[0] + 1))
         channel_gate, aux = gate(vis, ir, intent)
+        hook.remove()
+        self.assertEqual(call_count[0], 1)
+        with torch.no_grad():
+            legacy_channel_gate, legacy_image_gate = self._legacy_forward(
+                gate, vis.detach(), ir.detach(), intent.detach(),
+            )
+        torch.testing.assert_close(channel_gate.detach(), legacy_channel_gate, atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(aux["weight"].detach(), legacy_image_gate, atol=1e-6, rtol=1e-5)
 
         self.assertEqual(channel_gate.shape, (1, 64, 32, 32))
         self.assertEqual(aux["weight"].shape, (1, 1, 32, 32))
