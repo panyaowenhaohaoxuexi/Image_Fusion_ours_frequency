@@ -109,6 +109,40 @@ def should_update_best(val_score: float, best_val_score: float, val_metrics: dic
     return current_score > current_best
 
 
+def should_run_validation(
+    epoch_number: int,
+    validation_start_epoch: int,
+) -> bool:
+    """Return whether validation should run for a one-based epoch number."""
+    if epoch_number < 1:
+        raise ValueError("epoch_number must use one-based indexing and be >= 1.")
+    if validation_start_epoch < 1:
+        raise ValueError("validation_start_epoch must be >= 1.")
+    return epoch_number >= validation_start_epoch
+
+
+def validate_positive_baseline_metrics(metrics: dict, metric_names) -> dict:
+    """Validate the fixed validation baseline required for ratio scoring."""
+    validated = {}
+    for name in metric_names:
+        if name not in metrics:
+            raise KeyError(f"Validation baseline missing metric: {name}")
+
+        value = float(metrics[name])
+        if not math.isfinite(value):
+            raise ValueError(
+                f"Validation baseline metric {name} is not finite: {value}"
+            )
+        if value <= 0:
+            raise ValueError(
+                f"Validation baseline metric {name} must be positive for ratio "
+                f"scoring, got {value}"
+            )
+        validated[name] = value
+
+    return validated
+
+
 # ---------------------------------------------------------------------------
 # Learning rate scheduler
 # ---------------------------------------------------------------------------

@@ -23,8 +23,10 @@ from utils.training_utils import (
     get_frequency_weight,
     load_modules_from_checkpoint,
     save_checkpoint,
+    should_run_validation,
     should_update_best,
     validate_checkpoint_metadata,
+    validate_positive_baseline_metrics,
 )
 from utils.val_metrics import _quantize_to_uint8, _validate_source_uint8, compute_val_metrics
 from utils.validation_dataset import PairedValidationDataset
@@ -418,6 +420,90 @@ class ValidationScoreTests(unittest.TestCase):
             compute_validation_score(metrics, self.base, self.weights)
 
 
+class ValidationScheduleTests(unittest.TestCase):
+    def test_validation_starts_at_the_configured_one_based_epoch(self):
+        self.assertFalse(should_run_validation(1, 15))
+        self.assertFalse(should_run_validation(14, 15))
+        self.assertTrue(should_run_validation(15, 15))
+        self.assertTrue(should_run_validation(16, 15))
+        self.assertTrue(should_run_validation(50, 15))
+
+    def test_validation_schedule_rejects_non_positive_epochs(self):
+        for epoch_number in (0, -1):
+            with self.assertRaises(ValueError):
+                should_run_validation(epoch_number, 15)
+        for validation_start_epoch in (0, -1):
+            with self.assertRaises(ValueError):
+                should_run_validation(15, validation_start_epoch)
+
+
+class ValidationBaselineTests(unittest.TestCase):
+    metrics_epoch15 = {
+        "EN": 7.0,
+        "SD": 40.0,
+        "SCD": 1.6,
+        "VIF": 1.0,
+        "QABF": 0.7,
+        "MI": 3.6,
+    }
+    weights = {
+        "EN": 0.15,
+        "SD": 0.10,
+        "SCD": 0.20,
+        "VIF": 0.20,
+        "QABF": 0.25,
+        "MI": 0.10,
+    }
+
+    def test_positive_baseline_returns_float_copy_and_scores_as_one(self):
+        baseline_metrics = validate_positive_baseline_metrics(
+            self.metrics_epoch15,
+            self.weights,
+        )
+        self.assertEqual(baseline_metrics, self.metrics_epoch15)
+        self.assertIsNot(baseline_metrics, self.metrics_epoch15)
+        self.assertTrue(all(isinstance(value, float) for value in baseline_metrics.values()))
+
+        score, ratios = compute_validation_score(
+            self.metrics_epoch15,
+            baseline_metrics,
+            self.weights,
+        )
+        self.assertAlmostEqual(score, 1.0, places=5)
+        for ratio in ratios.values():
+            self.assertAlmostEqual(ratio, 1.0, places=5)
+        self.assertTrue(should_update_best(score, -float("inf"), self.metrics_epoch15))
+
+    def test_positive_baseline_rejects_missing_metric(self):
+        metrics = dict(self.metrics_epoch15)
+        del metrics["EN"]
+        with self.assertRaisesRegex(KeyError, "Validation baseline missing metric: EN"):
+            validate_positive_baseline_metrics(metrics, self.weights)
+
+    def test_positive_baseline_rejects_non_finite_metrics(self):
+        for invalid_value in (float("nan"), float("inf"), -float("inf")):
+            metrics = dict(self.metrics_epoch15, EN=invalid_value)
+            with self.assertRaisesRegex(ValueError, "Validation baseline metric EN is not finite"):
+                validate_positive_baseline_metrics(metrics, self.weights)
+
+    def test_positive_baseline_rejects_zero_or_negative_metrics(self):
+        for invalid_value in (0.0, -0.1):
+            metrics = dict(self.metrics_epoch15, EN=invalid_value)
+            with self.assertRaisesRegex(ValueError, "Validation baseline metric EN must be positive"):
+                validate_positive_baseline_metrics(metrics, self.weights)
+
+    def test_fixed_baseline_is_not_replaced_by_later_metrics(self):
+        baseline_metrics = validate_positive_baseline_metrics(
+            self.metrics_epoch15,
+            self.weights,
+        )
+        metrics_epoch16 = {name: value * 1.1 for name, value in self.metrics_epoch15.items()}
+        score, _ = compute_validation_score(metrics_epoch16, baseline_metrics, self.weights)
+
+        self.assertGreater(score, 1.0)
+        self.assertEqual(baseline_metrics, self.metrics_epoch15)
+
+
 # ---------------------------------------------------------------------------
 # 8.7 BestCheckpointTests
 # ---------------------------------------------------------------------------
@@ -594,6 +680,31 @@ class CheckpointUtilitiesTests(unittest.TestCase):
                             val_metrics=metrics, val_ratios={"EN": 1.1}, is_best=False)
             self.assertFalse(os.path.exists(path + ".tmp"))
             self.assertEqual(torch.load(path, map_location="cpu")["epoch"], 2)
+
+    def test_latest_checkpoint_allows_missing_validation_fields(self):
+        modules = self._modules()
+        optimizer, scheduler = self._optimizer_and_scheduler(modules)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "latest.pth")
+            save_checkpoint(
+                path,
+                modules,
+                optimizer,
+                scheduler,
+                epoch=1,
+                val_score=None,
+                val_metrics=None,
+                val_ratios=None,
+                is_best=False,
+            )
+            checkpoint = torch.load(path, map_location="cpu")
+            self.assertFalse(os.path.exists(path + ".tmp"))
+
+        self.assertTrue(set(_MODEL_KEYS).issubset(checkpoint))
+        self.assertTrue({"optimizer", "scheduler", "epoch", "is_best"}.issubset(checkpoint))
+        self.assertNotIn("val_score", checkpoint)
+        self.assertNotIn("val_metrics", checkpoint)
+        self.assertNotIn("val_ratios", checkpoint)
 
     def test_save_checkpoint_rejects_wrong_module_counts(self):
         with tempfile.TemporaryDirectory() as tmpdir:

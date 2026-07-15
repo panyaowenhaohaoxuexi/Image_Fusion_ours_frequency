@@ -20,8 +20,7 @@ VAL_INFRARED_DIR = r"F:\1_paper_pan\2_Image_Fusion\validation_20\infrared"
 VAL_VISIBLE_RGB_DIR = None  # None = reuse visible/ for CLIP RGB
 VAL_EXPECTED_PAIRS = 20
 
-VAL_BASELINE_CHECKPOINT = r"<FILL_ME_PATH_TO_FIXED_V11_CHECKPOINT>"
-VAL_BASELINE_JSON = r"F:\1_paper_pan\2_Image_Fusion\validation_baseline_metrics.json"
+VALIDATION_START_EPOCH = 15
 
 # --- Training hyperparameters ---
 BASE_LR = 1e-4
@@ -66,16 +65,9 @@ def validate_runtime_config() -> None:
         errors.append(
             f"VAL_VISIBLE_RGB_DIR must be an existing directory when configured: {VAL_VISIBLE_RGB_DIR}"
         )
-    if '<FILL_ME' in VAL_BASELINE_CHECKPOINT:
-        errors.append("VAL_BASELINE_CHECKPOINT still contains a <FILL_ME...> placeholder.")
-    elif not os.path.isfile(VAL_BASELINE_CHECKPOINT):
-        errors.append(f"VAL_BASELINE_CHECKPOINT must be an existing file: {VAL_BASELINE_CHECKPOINT}")
     if not os.path.isfile(CLIP_MODEL_NAME):
         errors.append(f"CLIP_MODEL_NAME must be an existing file: {CLIP_MODEL_NAME}")
 
-    baseline_parent = os.path.dirname(VAL_BASELINE_JSON)
-    if baseline_parent:
-        os.makedirs(baseline_parent, exist_ok=True)
     os.makedirs(MODEL_DIRECTORY, exist_ok=True)
 
     if errors:

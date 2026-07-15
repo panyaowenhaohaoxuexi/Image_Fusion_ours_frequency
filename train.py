@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 import datetime
-import gc
-import json
 import math
 import os
 import sys
@@ -30,12 +28,11 @@ from config import (
     MODEL_DIRECTORY,
     TRAIN_H5_PATH,
     USE_CLIP_IMAGE_QUERY,
-    VAL_BASELINE_CHECKPOINT,
-    VAL_BASELINE_JSON,
     VAL_EXPECTED_PAIRS,
     VAL_INFRARED_DIR,
     VAL_VISIBLE_DIR,
     VAL_VISIBLE_RGB_DIR,
+    VALIDATION_START_EPOCH,
     WARMUP_EPOCHS,
     WEIGHT_DECAY,
     validate_runtime_config,
@@ -65,10 +62,10 @@ from utils.training_utils import (
     compute_validation_score,
     get_frequency_weight,
     init_csv,
-    load_modules_from_checkpoint,
     save_checkpoint,
+    should_run_validation,
     should_update_best,
-    validate_checkpoint_metadata,
+    validate_positive_baseline_metrics,
 )
 from utils.val_metrics import compute_val_metrics
 from utils.validation_dataset import PairedValidationDataset
@@ -79,7 +76,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 
 # ---------------------------------------------------------------------------
-# Single build_model (shared by training and baseline)
+# Model construction
 # ---------------------------------------------------------------------------
 
 def build_model(device: torch.device):
@@ -174,142 +171,6 @@ def run_validation(modules, valloader, device):
 
 
 # ---------------------------------------------------------------------------
-# Baseline
-# ---------------------------------------------------------------------------
-
-def validate_baseline_json(json_path, val_filenames):
-    """Validate baseline JSON has all required fields and matches current val set."""
-    with open(json_path, 'r') as f:
-        data = json.load(f)
-
-    # Check required metric fields
-    for k in METRIC_WEIGHTS:
-        if k not in data:
-            raise KeyError(f"Baseline JSON missing metric key: {k}")
-        v = float(data[k])
-        if not math.isfinite(v):
-            raise ValueError(f"Baseline metric {k} is not finite: {v}")
-        if v <= 0:
-            raise ValueError(f"Baseline metric {k} is not positive: {v}")
-
-    # Check validation filenames consistency
-    saved_filenames = data.get("validation_filenames")
-    if saved_filenames is None:
-        raise ValueError("Baseline JSON missing validation_filenames field.")
-    if saved_filenames != val_filenames:
-        raise ValueError(
-            "Validation filenames changed since baseline was generated. "
-            "Delete the baseline JSON and re-run to regenerate."
-        )
-
-    # Check validation_count
-    saved_count = data.get("validation_count")
-    if saved_count is None:
-        raise ValueError("Baseline JSON missing validation_count field.")
-    if saved_count != len(val_filenames):
-        raise ValueError(
-            "Baseline validation_count does not match the current validation set."
-        )
-
-    # Check baseline checkpoint path consistency
-    saved_checkpoint = data.get("baseline_checkpoint_path")
-    if saved_checkpoint is None:
-        raise ValueError("Baseline JSON missing baseline_checkpoint_path.")
-    if os.path.abspath(saved_checkpoint) != os.path.abspath(VAL_BASELINE_CHECKPOINT):
-        raise ValueError(
-            "Baseline checkpoint path changed. "
-            "Delete the old baseline JSON and regenerate it."
-        )
-
-    # Check that the referenced checkpoint still exists with same size/mtime
-    if not os.path.isfile(saved_checkpoint):
-        raise ValueError(
-            f"Baseline checkpoint no longer exists: {saved_checkpoint}"
-        )
-    saved_size = data.get("baseline_checkpoint_size")
-    if saved_size is None:
-        raise ValueError(
-            "Baseline JSON missing baseline_checkpoint_size."
-        )
-    saved_mtime = data.get("baseline_checkpoint_mtime")
-    if saved_mtime is None:
-        raise ValueError(
-            "Baseline JSON missing baseline_checkpoint_mtime."
-        )
-    current_stat = os.stat(saved_checkpoint)
-    if int(saved_size) != int(current_stat.st_size):
-        raise ValueError(
-            "Baseline checkpoint size changed. "
-            "Delete the old baseline JSON and regenerate it."
-        )
-    if abs(float(saved_mtime) - float(current_stat.st_mtime)) > 1.0:
-        raise ValueError(
-            "Baseline checkpoint mtime changed. "
-            "Delete the old baseline JSON and regenerate it."
-        )
-
-    return data
-
-
-def generate_baseline(device, val_filenames):
-    """Generate baseline metrics JSON from the fixed checkpoint."""
-    if not os.path.isfile(VAL_BASELINE_CHECKPOINT):
-        raise FileNotFoundError(f"Baseline checkpoint not found: {VAL_BASELINE_CHECKPOINT}")
-
-    # Build separate baseline modules
-    baseline_modules = build_model(device)
-
-    try:
-        # Load checkpoint to CPU first to reduce peak GPU memory
-        checkpoint = torch.load(VAL_BASELINE_CHECKPOINT, map_location="cpu")
-
-        # Strict metadata validation (reuse test.py logic)
-        validate_checkpoint_metadata(checkpoint, baseline_modules[1])
-
-        # Strict key validation (all 9 keys must exist) and load to modules on GPU
-        load_modules_from_checkpoint(baseline_modules, checkpoint)
-
-        # Release CPU checkpoint immediately after loading
-        del checkpoint
-        gc.collect()
-
-        val_dataset = PairedValidationDataset(
-            visible_dir=VAL_VISIBLE_DIR,
-            infrared_dir=VAL_INFRARED_DIR,
-            visible_rgb_dir=VAL_VISIBLE_RGB_DIR,
-            expected_pairs=VAL_EXPECTED_PAIRS,
-        )
-        valloader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0,
-                               pin_memory=torch.cuda.is_available())
-
-        metrics = run_validation(baseline_modules, valloader, device)
-
-        checkpoint_stat = os.stat(VAL_BASELINE_CHECKPOINT)
-        baseline_data = {
-            **metrics,
-            "validation_filenames": val_filenames,
-            "validation_count": len(val_filenames),
-            "baseline_checkpoint_path": VAL_BASELINE_CHECKPOINT,
-            "baseline_checkpoint_size": checkpoint_stat.st_size,
-            "baseline_checkpoint_mtime": checkpoint_stat.st_mtime,
-        }
-
-        baseline_json_dir = os.path.dirname(VAL_BASELINE_JSON) or "."
-        os.makedirs(baseline_json_dir, exist_ok=True)
-        with open(VAL_BASELINE_JSON, 'w') as f:
-            json.dump(baseline_data, f, indent=2)
-
-        print(f"Baseline saved to: {VAL_BASELINE_JSON}")
-        print(f"Baseline metrics: {metrics}")
-
-    finally:
-        del baseline_modules
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-
-# ---------------------------------------------------------------------------
 # Training forward pass
 # ---------------------------------------------------------------------------
 
@@ -340,25 +201,15 @@ def main():
     validate_runtime_config()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # --- Validation dataset (used for both baseline and per-epoch validation) ---
+    # --- Fixed validation dataset ---
     val_dataset = PairedValidationDataset(
         visible_dir=VAL_VISIBLE_DIR,
         infrared_dir=VAL_INFRARED_DIR,
         visible_rgb_dir=VAL_VISIBLE_RGB_DIR,
         expected_pairs=VAL_EXPECTED_PAIRS,
     )
-    val_filenames = list(val_dataset.filenames)
     valloader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0,
                            pin_memory=torch.cuda.is_available())
-
-    # --- Baseline ---
-    if not os.path.isfile(VAL_BASELINE_JSON):
-        print("Baseline JSON not found, generating from checkpoint...")
-        generate_baseline(device, val_filenames)
-
-    baseline_data = validate_baseline_json(VAL_BASELINE_JSON, val_filenames)
-    baseline_metrics = {k: baseline_data[k] for k in METRIC_WEIGHTS}
-    print(f"Baseline metrics: {baseline_metrics}")
 
     # --- Loss criteria ---
     criteria_fusion = Fusionloss().to(device)
@@ -409,7 +260,8 @@ def main():
     csv_path = os.path.join(MODEL_DIRECTORY, f'training_history_{timestamp}.csv')
     init_csv(csv_path)
 
-    # --- Best tracking ---
+    # --- Validation baseline and best tracking ---
+    baseline_metrics = None
     best_val_score = -float("inf")
     best_epoch = -1
     best_metrics = None
@@ -529,68 +381,114 @@ def main():
               f"corr={avg_corr:.6f} w_corr={avg_weighted_corr:.6f} "
               f"ctr={avg_local_ctr:.6f} w_ctr={avg_weighted_local_ctr:.6f}")
 
-        # === Validation ===
-        val_metrics = run_validation(modules, valloader, device)
+        current_epoch = epoch + 1
+        val_metrics = None
+        val_score = None
+        val_ratios = None
+        worst_ratio = None
+        is_best = False
 
-        # Compute validation score with exception handling for non-finite metrics
-        try:
-            val_score, val_ratios = compute_validation_score(
-                metrics=val_metrics,
-                baseline_metrics=baseline_metrics,
-                metric_weights=METRIC_WEIGHTS,
+        if should_run_validation(current_epoch, VALIDATION_START_EPOCH):
+            val_metrics = run_validation(modules, valloader, device)
+
+            if baseline_metrics is None:
+                try:
+                    baseline_metrics = validate_positive_baseline_metrics(
+                        val_metrics,
+                        METRIC_WEIGHTS,
+                    )
+                except (KeyError, ValueError) as error:
+                    raise RuntimeError(
+                        f"Failed to initialize validation baseline "
+                        f"at epoch {current_epoch}: {error}"
+                    ) from error
+
+                print(
+                    f"[Validation Baseline] Initialized from epoch "
+                    f"{current_epoch}: {baseline_metrics}"
+                )
+
+            try:
+                val_score, val_ratios = compute_validation_score(
+                    metrics=val_metrics,
+                    baseline_metrics=baseline_metrics,
+                    metric_weights=METRIC_WEIGHTS,
+                )
+                worst_ratio = min(val_ratios.values())
+                is_best = should_update_best(
+                    val_score,
+                    best_val_score,
+                    val_metrics,
+                )
+            except (KeyError, ValueError) as error:
+                print(
+                    f"[WARNING] Validation scoring failed "
+                    f"at epoch {current_epoch}: {error}"
+                )
+                val_score = float("nan")
+                val_ratios = {
+                    name: float("nan")
+                    for name in METRIC_WEIGHTS
+                }
+                worst_ratio = float("nan")
+                is_best = False
+
+            print(f"[Validation] EN={val_metrics['EN']:.4f} SD={val_metrics['SD']:.4f} "
+                  f"SCD={val_metrics['SCD']:.4f} VIF={val_metrics['VIF']:.4f} "
+                  f"QABF={val_metrics['QABF']:.4f} MI={val_metrics['MI']:.4f} "
+                  f"score={val_score:.6f} worst_ratio={worst_ratio:.4f}")
+
+            if is_best:
+                best_val_score = float(val_score)
+                best_epoch = current_epoch
+                best_metrics = dict(val_metrics)
+                best_ratios = dict(val_ratios)
+
+                save_checkpoint(
+                    path=best_checkpoint_path,
+                    modules=modules,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch=best_epoch,
+                    val_score=best_val_score,
+                    val_metrics=best_metrics,
+                    val_ratios=best_ratios,
+                    is_best=True,
+                )
+                print(f"[Best] epoch={best_epoch} score={best_val_score:.6f} "
+                      f"metrics={best_metrics} ratios={best_ratios}")
+                print(f"[Best] saved to {best_checkpoint_path}")
+        else:
+            print(
+                f"[Validation] Skipped at epoch {current_epoch}; "
+                f"validation starts after training epoch "
+                f"{VALIDATION_START_EPOCH}."
             )
-        except (ValueError, KeyError) as error:
-            print(f"[WARNING] Validation scoring failed: {error}")
-            val_score = float("nan")
-            val_ratios = {name: float("nan") for name in METRIC_WEIGHTS}
 
-        worst_ratio = min(val_ratios.values())
-
-        print(f"[Validation] EN={val_metrics['EN']:.4f} SD={val_metrics['SD']:.4f} "
-              f"SCD={val_metrics['SCD']:.4f} VIF={val_metrics['VIF']:.4f} "
-              f"QABF={val_metrics['QABF']:.4f} MI={val_metrics['MI']:.4f} "
-              f"score={val_score:.6f} worst_ratio={worst_ratio:.4f}")
-
-        # --- Determine best ---
-        is_best = should_update_best(val_score, best_val_score, val_metrics)
-        if is_best:
-            best_val_score = val_score
-            best_epoch = epoch + 1
-            best_metrics = dict(val_metrics)
-            best_ratios = dict(val_ratios)
-
-            save_checkpoint(
-                path=best_checkpoint_path,
-                modules=modules,
-                optimizer=optimizer, scheduler=scheduler,
-                epoch=best_epoch, val_score=best_val_score,
-                val_metrics=best_metrics, val_ratios=best_ratios,
-                is_best=True,
-            )
-            print(f"[Best] epoch={best_epoch} score={best_val_score:.6f} "
-                  f"metrics={best_metrics} ratios={best_ratios}")
-            print(f"[Best] saved to {best_checkpoint_path}")
-        elif not math.isfinite(float(val_score)) or not all(
-            math.isfinite(float(value)) for value in val_metrics.values()
-        ):
-            print(f"[WARNING] Validation metrics non-finite (val_score={val_score}), "
-                  f"skipping best checkpoint update.")
-
-        # Always save latest: it is manually restorable for a future resume workflow;
-        # this main() path intentionally continues to train from scratch.
         save_checkpoint(
             path=latest_checkpoint_path,
             modules=modules,
-            optimizer=optimizer, scheduler=scheduler,
-            epoch=epoch + 1, val_score=val_score,
-            val_metrics=val_metrics, val_ratios=val_ratios,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epoch=current_epoch,
+            val_score=val_score,
+            val_metrics=val_metrics,
+            val_ratios=val_ratios,
             is_best=is_best,
         )
+
+        csv_val_metrics = (
+            {name: "" for name in METRIC_WEIGHTS}
+            if val_metrics is None else val_metrics
+        )
+        csv_val_score = "" if val_score is None else val_score
+        csv_worst_ratio = "" if worst_ratio is None else worst_ratio
+        csv_best_score = "" if best_epoch < 0 else best_val_score
 
         # --- CSV ---
         append_csv(
             csv_path,
-            epoch=epoch + 1,
+            epoch=current_epoch,
             learning_rate=current_lr,
             avg_grad_norm=avg_grad_norm,
             train_total=avg_total,
@@ -605,27 +503,30 @@ def main():
             train_weighted_correlation=avg_weighted_corr,
             train_local_contrast=avg_local_ctr,
             train_weighted_local_contrast=avg_weighted_local_ctr,
-            val_EN=val_metrics['EN'],
-            val_SD=val_metrics['SD'],
-            val_SCD=val_metrics['SCD'],
-            val_VIF=val_metrics['VIF'],
-            val_QABF=val_metrics['QABF'],
-            val_MI=val_metrics['MI'],
-            val_score=val_score,
-            worst_ratio=worst_ratio,
+            val_EN=csv_val_metrics['EN'],
+            val_SD=csv_val_metrics['SD'],
+            val_SCD=csv_val_metrics['SCD'],
+            val_VIF=csv_val_metrics['VIF'],
+            val_QABF=csv_val_metrics['QABF'],
+            val_MI=csv_val_metrics['MI'],
+            val_score=csv_val_score,
+            worst_ratio=csv_worst_ratio,
             is_best=1 if is_best else 0,
             best_epoch_so_far=best_epoch,
-            best_score_so_far=best_val_score,
+            best_score_so_far=csv_best_score,
         )
 
     # === Training completed ===
     print(f"\n{'='*60}")
     print(f"Training completed")
-    print(f"Best epoch: {best_epoch}")
-    print(f"Best validation score: {best_val_score:.6f}")
-    print(f"Best validation metrics: {best_metrics}")
-    print(f"Best validation ratios: {best_ratios}")
-    print(f"Best checkpoint: {best_checkpoint_path}")
+    if best_epoch < 0:
+        print("No best checkpoint was produced because validation never ran.")
+    else:
+        print(f"Best epoch: {best_epoch}")
+        print(f"Best validation score: {best_val_score:.6f}")
+        print(f"Best validation metrics: {best_metrics}")
+        print(f"Best validation ratios: {best_ratios}")
+        print(f"Best checkpoint: {best_checkpoint_path}")
     print(f"Latest checkpoint: {latest_checkpoint_path}")
     print(f"Training history: {csv_path}")
     print(f"{'='*60}")
