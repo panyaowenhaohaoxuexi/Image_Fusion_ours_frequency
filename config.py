@@ -12,3 +12,40 @@ CLIP_MODEL_NAME = str(PROJECT_ROOT / "weight" / "clip" / "ViT-B-32.pt")
 CLIP_DOWNLOAD_ROOT = str(PROJECT_ROOT / "weight" / "clip")
 TRAIN_H5_PATH = r"F:\1_paper_pan\2_Image_Fusion\2_Datasets\1_MSRS\MSRS_train_imgsize_128_stride_200_rgb.h5"
 MODEL_DIRECTORY = str(PROJECT_ROOT / "models")
+
+# --- Validation (fixed 20 pairs) ---
+VAL_VISIBLE_DIR = r"F:\1_paper_pan\2_Image_Fusion\validation_20\visible"
+VAL_INFRARED_DIR = r"F:\1_paper_pan\2_Image_Fusion\validation_20\infrared"
+VAL_VISIBLE_RGB_DIR = None  # None = reuse visible/ for CLIP RGB
+VAL_EXPECTED_PAIRS = 20
+
+VAL_BASELINE_CHECKPOINT = r"<FILL_ME_PATH_TO_FIXED_V11_CHECKPOINT>"
+VAL_BASELINE_JSON = r"F:\1_paper_pan\2_Image_Fusion\validation_baseline_metrics.json"
+
+# --- Training hyperparameters ---
+BASE_LR = 1e-4
+MIN_LR = 1e-6
+WEIGHT_DECAY = 1e-4
+BETAS = (0.9, 0.999)
+
+WARMUP_EPOCHS = 5
+FREQUENCY_WARMUP_EPOCHS = 10
+GLOBAL_GRAD_CLIP = 0.1
+
+COEFF_FUSION = 1.0
+COEFF_SSIM = 2.0
+COEFF_FREQ_FINAL = 0.5
+COEFF_CORRELATION = 0.2
+COEFF_LOCAL_CONTRAST = 0.2
+
+BATCH_SIZE = 8
+
+# --- Validation score weights ---
+METRIC_WEIGHTS = {
+    "EN": 0.15,
+    "SD": 0.10,
+    "SCD": 0.20,
+    "VIF": 0.20,
+    "QABF": 0.25,
+    "MI": 0.10,
+}

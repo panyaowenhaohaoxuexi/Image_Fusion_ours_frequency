@@ -1,12 +1,17 @@
 import numpy as np
 from scipy.signal import convolve2d
-from Qabf import get_Qabf
-from Nabf import get_Nabf
+try:
+    from .Qabf import get_Qabf
+    from .Nabf import get_Nabf
+    from .ssim import ssim, ms_ssim
+except ImportError:
+    from Qabf import get_Qabf
+    from Nabf import get_Nabf
+    from ssim import ssim, ms_ssim
 import math
 import torch
 import torch.nn.functional as F
 import torch.fft
-from ssim import ssim, ms_ssim
 from sklearn.metrics import normalized_mutual_info_score
 
 def EN_function(image_tensor):

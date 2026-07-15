@@ -156,8 +156,21 @@ class FrequencyConsistencyLoss(nn.Module):
         return total, pos_loss.detach(), neg_loss.detach()
 
 
-def cc(img1: torch.Tensor, img2: torch.Tensor):
-    eps = torch.finfo(torch.float32).eps
+def cc(
+    img1: torch.Tensor,
+    img2: torch.Tensor,
+) -> torch.Tensor:
+    if img1.shape != img2.shape:
+        raise ValueError(
+            f"cc input shapes must match, "
+            f"got {img1.shape} and {img2.shape}."
+        )
+    if img1.ndim != 4:
+        raise ValueError(
+            "cc expects tensors with shape (N, C, H, W)."
+        )
+
+    eps = torch.finfo(img1.dtype).eps
     n, c, _, _ = img1.shape
 
     img1 = img1.reshape(n, c, -1)
@@ -166,11 +179,13 @@ def cc(img1: torch.Tensor, img2: torch.Tensor):
     img1 = img1 - img1.mean(dim=-1, keepdim=True)
     img2 = img2 - img2.mean(dim=-1, keepdim=True)
 
-    corr = torch.sum(img1 * img2, dim=-1) / (
-        eps
-        + torch.sqrt(torch.sum(img1 ** 2, dim=-1))
-        * torch.sqrt(torch.sum(img2 ** 2, dim=-1))
-    )
+    numerator = torch.sum(img1 * img2, dim=-1)
+
+    norm1 = torch.sqrt(torch.sum(img1 ** 2, dim=-1) + eps)
+    norm2 = torch.sqrt(torch.sum(img2 ** 2, dim=-1) + eps)
+    denominator = norm1 * norm2
+
+    corr = numerator / denominator
     return torch.clamp(corr, -1.0, 1.0).mean()
 
 
@@ -239,3 +254,114 @@ class CLIPSemanticConsistencyLoss(nn.Module):
         loss_ir = 1.0 - F.cosine_similarity(fused_feat, ir_feat, dim=-1).mean()
         total = 0.5 * (loss_vis + loss_ir)
         return total, {'sem_vis': loss_vis.detach(), 'sem_ir': loss_ir.detach()}
+
+
+class CorrelationConsistencyLoss(nn.Module):
+    """Preserve correlation between fused and source images."""
+
+    def forward(
+        self,
+        image_vis: torch.Tensor,
+        image_ir: torch.Tensor,
+        fused: torch.Tensor,
+    ) -> torch.Tensor:
+        vis = image_vis[:, :1]
+        ir = image_ir[:, :1]
+        fused_y = fused[:, :1]
+
+        loss_vis = 1.0 - cc(fused_y, vis)
+        loss_ir = 1.0 - cc(fused_y, ir)
+
+        loss = loss_vis + loss_ir
+
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                "CorrelationConsistencyLoss produced NaN or Inf."
+            )
+
+        return loss
+
+
+class LocalContrastLoss(nn.Module):
+    """Match fused local contrast to a stable source-derived target."""
+
+    def __init__(
+        self,
+        window_size: int = 7,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+
+        if window_size <= 0 or window_size % 2 == 0:
+            raise ValueError(
+                "window_size must be a positive odd integer."
+            )
+
+        self.window_size = window_size
+        self.padding = window_size // 2
+        self.eps = eps
+
+    def _local_std(
+        self,
+        image: torch.Tensor,
+    ) -> torch.Tensor:
+        # Use reflect padding to avoid edge artifacts from zero-padding
+        image_padded = F.pad(
+            image,
+            [self.padding] * 4,
+            mode="reflect",
+        )
+        image_sq_padded = image_padded * image_padded
+
+        local_mean = F.avg_pool2d(
+            image_padded,
+            kernel_size=self.window_size,
+            stride=1,
+            padding=0,
+        )
+
+        local_square_mean = F.avg_pool2d(
+            image_sq_padded,
+            kernel_size=self.window_size,
+            stride=1,
+            padding=0,
+        )
+
+        local_variance = (
+            local_square_mean
+            - local_mean * local_mean
+        ).clamp_min(0.0)
+
+        return torch.sqrt(
+            local_variance + self.eps
+        )
+
+    def forward(
+        self,
+        image_vis: torch.Tensor,
+        image_ir: torch.Tensor,
+        fused: torch.Tensor,
+    ) -> torch.Tensor:
+        vis = image_vis[:, :1]
+        ir = image_ir[:, :1]
+        fused_y = fused[:, :1]
+
+        std_vis = self._local_std(vis)
+        std_ir = self._local_std(ir)
+        std_fused = self._local_std(fused_y)
+
+        std_max = torch.maximum(std_vis, std_ir)
+        std_mean = 0.5 * (std_vis + std_ir)
+
+        target_std = (
+            0.7 * std_max + 0.3 * std_mean
+        ).detach()
+
+        loss = F.l1_loss(std_fused, target_std)
+
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                "LocalContrastLoss produced NaN or Inf."
+            )
+
+        return loss
