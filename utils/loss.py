@@ -169,6 +169,8 @@ def cc(
         raise ValueError(
             "cc expects tensors with shape (N, C, H, W)."
         )
+    if not img1.is_floating_point() or not img2.is_floating_point():
+        raise TypeError("cc expects floating-point tensors.")
 
     eps = torch.finfo(img1.dtype).eps
     n, c, _, _ = img1.shape
@@ -305,6 +307,17 @@ class LocalContrastLoss(nn.Module):
         self,
         image: torch.Tensor,
     ) -> torch.Tensor:
+        if image.ndim != 4:
+            raise ValueError(
+                "LocalContrastLoss expects input with shape (N, C, H, W)."
+            )
+        height, width = image.shape[-2:]
+        if height <= self.padding or width <= self.padding:
+            raise ValueError(
+                f"Input spatial size {(height, width)} must be larger than "
+                f"reflect padding {self.padding}."
+            )
+
         # Use reflect padding to avoid edge artifacts from zero-padding
         image_padded = F.pad(
             image,

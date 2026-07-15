@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import os
 from pathlib import Path
 
 
@@ -49,3 +50,33 @@ METRIC_WEIGHTS = {
     "QABF": 0.25,
     "MI": 0.10,
 }
+
+
+def validate_runtime_config() -> None:
+    """Fail before training when required local inputs are unavailable."""
+    errors = []
+
+    if not os.path.isfile(TRAIN_H5_PATH):
+        errors.append(f"TRAIN_H5_PATH must be an existing file: {TRAIN_H5_PATH}")
+    if not os.path.isdir(VAL_VISIBLE_DIR):
+        errors.append(f"VAL_VISIBLE_DIR must be an existing directory: {VAL_VISIBLE_DIR}")
+    if not os.path.isdir(VAL_INFRARED_DIR):
+        errors.append(f"VAL_INFRARED_DIR must be an existing directory: {VAL_INFRARED_DIR}")
+    if VAL_VISIBLE_RGB_DIR is not None and not os.path.isdir(VAL_VISIBLE_RGB_DIR):
+        errors.append(
+            f"VAL_VISIBLE_RGB_DIR must be an existing directory when configured: {VAL_VISIBLE_RGB_DIR}"
+        )
+    if '<FILL_ME' in VAL_BASELINE_CHECKPOINT:
+        errors.append("VAL_BASELINE_CHECKPOINT still contains a <FILL_ME...> placeholder.")
+    elif not os.path.isfile(VAL_BASELINE_CHECKPOINT):
+        errors.append(f"VAL_BASELINE_CHECKPOINT must be an existing file: {VAL_BASELINE_CHECKPOINT}")
+    if not os.path.isfile(CLIP_MODEL_NAME):
+        errors.append(f"CLIP_MODEL_NAME must be an existing file: {CLIP_MODEL_NAME}")
+
+    baseline_parent = os.path.dirname(VAL_BASELINE_JSON)
+    if baseline_parent:
+        os.makedirs(baseline_parent, exist_ok=True)
+    os.makedirs(MODEL_DIRECTORY, exist_ok=True)
+
+    if errors:
+        raise RuntimeError("Invalid runtime configuration:\n- " + "\n- ".join(errors))

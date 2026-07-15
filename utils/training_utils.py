@@ -5,6 +5,109 @@ import os
 
 import torch
 
+from config import MODEL_VERSION, USE_CLIP_IMAGE_QUERY
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+_MODEL_KEYS = (
+    'shared_encoder', 'intent_generator', 'frequency_fusion', 'frequency_pyramid_adapter',
+    'spatial_fusion', 'fsrc_l1', 'fsrc_l2', 'fsrc_l3', 'fusion_decoder',
+)
+
+
+def unwrap(module):
+    return module.module if isinstance(module, torch.nn.DataParallel) else module
+
+
+def _require_module_count(modules) -> None:
+    module_count = len(modules)
+    if module_count != len(_MODEL_KEYS):
+        raise ValueError(
+            f"Expected exactly {len(_MODEL_KEYS)} modules, got {module_count}."
+        )
+
+
+def save_checkpoint(
+    path,
+    modules,
+    optimizer=None, scheduler=None,
+    epoch=None, val_score=None, val_metrics=None, val_ratios=None,
+    is_best=False,
+):
+    _require_module_count(modules)
+    checkpoint = {
+        'model_version': MODEL_VERSION,
+        'use_clip_image_query': USE_CLIP_IMAGE_QUERY,
+        'intent_generator_type': type(unwrap(modules[1])).__name__,
+    }
+    for key, module in zip(_MODEL_KEYS, modules):
+        checkpoint[key] = module.state_dict()
+
+    if optimizer is not None:
+        checkpoint['optimizer'] = optimizer.state_dict()
+    if scheduler is not None:
+        checkpoint['scheduler'] = scheduler.state_dict()
+    if epoch is not None:
+        checkpoint['epoch'] = int(epoch)
+    if val_score is not None:
+        checkpoint['val_score'] = float(val_score)
+    if val_metrics is not None:
+        checkpoint['val_metrics'] = dict(val_metrics)
+    if val_ratios is not None:
+        checkpoint['val_ratios'] = dict(val_ratios)
+    checkpoint['is_best'] = bool(is_best)
+
+    parent_directory = os.path.dirname(path)
+    if parent_directory:
+        os.makedirs(parent_directory, exist_ok=True)
+    tmp_path = path + '.tmp'
+    try:
+        torch.save(checkpoint, tmp_path)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def validate_checkpoint_metadata(checkpoint, intent_generator):
+    """Validate metadata required for a compatible strict checkpoint load."""
+    expected_type = type(unwrap(intent_generator)).__name__
+    if checkpoint.get('model_version') != MODEL_VERSION:
+        raise RuntimeError('Checkpoint model version mismatch.')
+    if checkpoint.get('use_clip_image_query') != USE_CLIP_IMAGE_QUERY:
+        raise RuntimeError('Checkpoint query variant mismatch.')
+    if checkpoint.get('intent_generator_type') != expected_type:
+        raise RuntimeError('Checkpoint intent generator type mismatch.')
+
+
+def load_modules_from_checkpoint(modules, checkpoint):
+    """Strictly load every required model state from a checkpoint."""
+    _require_module_count(modules)
+    for key, module in zip(_MODEL_KEYS, modules):
+        if key not in checkpoint:
+            raise KeyError(f"Checkpoint missing key: {key}")
+        module.load_state_dict(checkpoint[key], strict=True)
+
+
+def should_update_best(val_score: float, best_val_score: float, val_metrics: dict) -> bool:
+    if not val_metrics:
+        return False
+
+    current_score = float(val_score)
+    current_best = float(best_val_score)
+
+    if not math.isfinite(current_score):
+        return False
+    if math.isnan(current_best):
+        return False
+    if not all(math.isfinite(float(value)) for value in val_metrics.values()):
+        return False
+
+    return current_score > current_best
+
 
 # ---------------------------------------------------------------------------
 # Learning rate scheduler

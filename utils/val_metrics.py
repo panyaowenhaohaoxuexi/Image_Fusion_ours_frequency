@@ -101,9 +101,10 @@ def compute_val_metrics(
     #   line 40-42: float tensor (from np.array(PIL 'L') -> tensor)
     #   line 44:    int32 ndarray
     #   line 45:    float32 ndarray (NOT float64!)
-    fused_float = torch.from_numpy(fused_u8.astype(np.float32))
-    vis_float = torch.from_numpy(vis_u8.astype(np.float32))
-    ir_float = torch.from_numpy(ir_u8.astype(np.float32))
+    metric_device = fused.device
+    fused_float = torch.from_numpy(fused_u8.astype(np.float32)).to(metric_device)
+    vis_float = torch.from_numpy(vis_u8.astype(np.float32)).to(metric_device)
+    ir_float = torch.from_numpy(ir_u8.astype(np.float32)).to(metric_device)
 
     fused_int32 = fused_u8.astype(np.int32)
     vis_int32 = vis_u8.astype(np.int32)

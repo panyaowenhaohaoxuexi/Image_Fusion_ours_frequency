@@ -33,9 +33,19 @@ IR_PATH = r"F:\1_paper_pan\2_Image_Fusion\2_Datasets\1_MSRS\MSRS-main_autodl\tes
 CKPT_PATH = r"F:\1_paper_pan\2_Image_Fusion\3_methods_pth_images\Ours\Complete\v11\pth\v11_clip_image_query_TextIntentDualDomainFusion_latest.pth"
 OUT_DIR = r"F:\1_paper_pan\2_Image_Fusion\3_methods_pth_images\Ours\Complete\v11\Introduction"
 
-# Manual override: [x1, y1, x2, y2] — set both to skip auto-detection.
-AREA1 = None   # degradation region  → frequency feature
-AREA2 = None   # fusion region       → spatial weight
+# Region selection mode:
+#   "interactive" → draw two boxes on the image yourself
+#   "auto"        → automatic selection via diff × darkness/texture/brightness
+#   Or set AREA1/AREA2 manually: [x1, y1, x2, y2]
+SELECT_MODE = "interactive"   # "interactive" / "auto"
+AREA1 = None   # degradation region  → frequency feature (only used if set)
+AREA2 = None   # fusion region       → spatial weight  (only used if set)
+
+# Spatial "without" overall attenuation: keeps 50:50 mix, scales down magnitude.
+#   1.0 → without = full-strength 0.5·fre + 0.5·spa (original)
+#   0.5 → without = half-strength
+#   0.3 → without = 30%-strength  (larger difference from "with")
+SPATIAL_WITHOUT_ATTENUATION = 0.1   # 越小 → 注入越弱 → 差异越大
 
 # Auto-detection parameters (used only when AREA1/AREA2 are None).
 WINDOW_SIZE = None          # None → min(100, min(H,W)//4)
@@ -47,7 +57,7 @@ DEVICE = None               # None → CUDA if available
 # Colormaps (kept separate because the two feature types have different
 # physical meanings and benefit from distinct colour scales).
 COLORMAP_FREQ = "RdBu_r"    # frequency fused-feature → diverging
-COLORMAP_SPATIAL = "Greens"  # IR-preference weight → sequential
+COLORMAP_SPATIAL = "Greens"  # spatial feature → sequential
 
 # Optional extras.
 SAVE_FULL_FSRC_LEVELS = True
@@ -106,17 +116,26 @@ def normalize_single(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
 
 
 def save_map(array: np.ndarray, png_path: Path, npy_path: Path, cmap: str,
-             colorbar: bool = False, label: str = ""):
+             colorbar: bool = False, label: str = "", output_size: int = 400):
+    """
+    Save a 2D map as PNG+NPY.  If colorbar=True the figure is rendered
+    at a fixed size so all panels share the same pixel dimensions.
+    """
     png_path.parent.mkdir(parents=True, exist_ok=True)
     if colorbar:
-        fig, ax = plt.subplots(figsize=(5, 4))
+        # Determine figure size to get output_size×output_size image area
+        dpi = 200
+        margin = 1.2  # extra width for colorbar + padding
+        fig_w = output_size * margin / dpi
+        fig_h = output_size / dpi
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
         im = ax.imshow(array, cmap=cmap, vmin=0.0, vmax=1.0)
         ax.set_xticks([])
         ax.set_yticks([])
-        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label(label, fontsize=10)
-        fig.savefig(str(png_path), dpi=300, bbox_inches="tight",
-                    pad_inches=0.05, facecolor="white")
+        cbar = fig.colorbar(im, ax=ax, fraction=0.05, pad=0.03)
+        cbar.set_label(label, fontsize=8)
+        fig.savefig(str(png_path), dpi=dpi, bbox_inches="tight",
+                    pad_inches=0.02, facecolor="white")
         plt.close(fig)
     else:
         plt.imsave(str(png_path), array, cmap=cmap, vmin=0.0, vmax=1.0)
@@ -212,10 +231,30 @@ def _score_map(diff_map, window_size):
 
 
 def _texture_score_map(rgb_image, window_size):
-    """Local texture richness via Laplacian magnitude in each ws×ws window."""
+    """Local texture/structure richness via standard deviation in each ws×ws window."""
     gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
-    lap = np.abs(cv2.Laplacian(gray, cv2.CV_32F))
-    return _score_map(lap, int(window_size))
+    # Per-pixel local std via integral image: std = sqrt(E[X²] - E[X]²)
+    sq = gray * gray
+    sum_g = cv2.integral(gray)
+    sum_sq = cv2.integral(sq)
+    # Extract window sums (same pattern as _score_map)
+    ws = int(window_size)
+    a_g, b_g = sum_g[:-ws, :-ws], sum_g[ws:, :-ws]
+    c_g, d_g = sum_g[:-ws, ws:], sum_g[ws:, ws:]
+    a_s, b_s = sum_sq[:-ws, :-ws], sum_sq[ws:, :-ws]
+    c_s, d_s = sum_sq[:-ws, ws:], sum_sq[ws:, ws:]
+    n = float(ws * ws)
+    mean = (d_g - b_g - c_g + a_g) / n
+    mean_sq = (d_s - b_s - c_s + a_s) / n
+    var = np.maximum(mean_sq - mean * mean, 0.0)
+    return np.sqrt(var)
+
+
+def _darkness_score_map(rgb_image, window_size):
+    """Local darkness: 1 - mean luminance in each ws×ws window."""
+    gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    dark = 1.0 - gray  # 1 = pitch black, 0 = bright white
+    return _score_map(dark, int(window_size))
 
 
 def _top_candidates(scores, k=200):
@@ -229,20 +268,22 @@ def _top_candidates(scores, k=200):
 
 def find_best_regions(diff_freq, diff_spatial, vis_rgb, ws_freq, ws_spa, min_distance):
     """
-    area1 ← best window on diff_freq (frequency disentanglement), ws_freq × ws_freq
-    area2 ← best window on diff_spatial × texture (spatial disentanglement
-            in richly textured regions), ws_spa × ws_spa (smaller, focused)
+    area1 ← diff_freq × darkness  (frequency disentanglement in low-light regions)
+    area2 ← diff_spatial × texture (spatial disentanglement in richly textured regions)
     """
     half_f = ws_freq / 2.0
     half_s = ws_spa / 2.0
 
     freq_scores = _score_map(diff_freq, ws_freq)
+    dark_scores = _darkness_score_map(vis_rgb, ws_freq)
     spat_scores = _score_map(diff_spatial, ws_spa)
     text_scores = _texture_score_map(vis_rgb, ws_spa)
+    bright_scores = 1.0 - _darkness_score_map(vis_rgb, ws_spa)  # own ws
 
-    spa_texture_scores = spat_scores * text_scores
+    freq_dark_scores = freq_scores * dark_scores      # area1: diff大 × 暗
+    spa_texture_scores = spat_scores * text_scores * bright_scores  # diff大 × 纹理 × 亮
 
-    freq_cands = _top_candidates(freq_scores)
+    freq_cands = _top_candidates(freq_dark_scores)
     spa_cands = _top_candidates(spa_texture_scores)
 
     best_pair = None
@@ -277,7 +318,15 @@ def find_best_regions(diff_freq, diff_spatial, vis_rgb, ws_freq, ws_spa, min_dis
         print(f"\n⚠  No non-overlapping pair found with min_distance={min_distance}."
               f" Using fallback.\n")
 
-    return best_pair
+    return best_pair, {    # diagnostic score maps
+        "freq_dark": freq_dark_scores,
+        "spa_texture": spa_texture_scores,
+        "spat_scores": spat_scores,
+        "text_scores": text_scores,
+        "bright_scores": bright_scores,
+        "freq_scores": freq_scores,
+        "dark_scores": dark_scores,
+    }
 
 
 # ---------------------------------------------------------------------
@@ -328,14 +377,17 @@ def forward_two_settings(device, ckpt_path, vis_path, ir_path):
     # ---- intents -------------------------------------------------------
     int_fre, int_spa, _ = intent_generator(vis_clip, vis_spa, ir_spa, vis_freq, ir_freq)
     int_shared = 0.5 * (int_fre + int_spa)
+    # Spatial "without" = attenuated balanced mix: λ·(0.5·fre + 0.5·spa)
+    λ = SPATIAL_WITHOUT_ATTENUATION
+    int_spa_without = λ * int_shared         # int_shared = 0.5·fre + 0.5·spa
 
     # ====================================================================
-    #  WITHOUT disentanglement  (single shared intent)
+    #  WITHOUT disentanglement
     # ====================================================================
     fused_freq_shared, freq_aux_shared = frequency_fusion(
         vis_freq, ir_freq, frequency_intent=int_shared)
     _, spatial_pyramid_shared, spa_aux_shared = spatial_fusion(
-        vis_spa, ir_spa, int_shared, return_aux=True, return_pyramid=True)
+        vis_spa, ir_spa, int_spa_without, return_aux=True, return_pyramid=True)
     freq_pyramid_shared = frequency_pyramid_adapter(
         fused_freq_shared, target_pyramid=spatial_pyramid_shared)
     d_l1_shared, _ = fsrc_l1(freq_pyramid_shared["l1"], spatial_pyramid_shared["l1"])
@@ -356,15 +408,16 @@ def forward_two_settings(device, ckpt_path, vis_path, ir_path):
     raw_freq_shared = _tensor_to_2d(fused_freq_shared)
     raw_freq_dis = _tensor_to_2d(fused_freq_dis)
 
-    # (b) Intent-modulated VIS feature  — vis_tilde from L1
-    # Pick the single most intent-responsive channel (not mean-of-64).
-    vis_tilde_shared = spa_aux_shared["l1_aux"]["vis_tilde"].detach().float()[0]  # [C,H,W]
-    vis_tilde_dis = spa_aux_dis["l1_aux"]["vis_tilde"].detach().float()[0]
-    chan_diffs = (vis_tilde_dis - vis_tilde_shared).abs().mean(dim=(1, 2))  # [C]
+    # (b) Spatial L1 fused output  — fused_l1 = w*ir_tilde + (1-w)*vis_tilde
+    # Gate output combines weight change + vis modulation + ir modulation.
+    # Pick the single most intent-responsive channel.
+    fused_l1_shared = spa_aux_shared["fused_l1"].detach().float()[0]  # [C,H,W]
+    fused_l1_dis = spa_aux_dis["fused_l1"].detach().float()[0]
+    chan_diffs = (fused_l1_dis - fused_l1_shared).abs().mean(dim=(1, 2))
     best_c = int(chan_diffs.argmax())
-    raw_spa_shared = vis_tilde_shared[best_c].cpu().numpy().astype(np.float32)
-    raw_spa_dis = vis_tilde_dis[best_c].cpu().numpy().astype(np.float32)
-    print(f"  Spatial vis_tilde: picked channel {best_c}/{vis_tilde_shared.shape[0]}"
+    raw_spa_shared = fused_l1_shared[best_c].cpu().numpy().astype(np.float32)
+    raw_spa_dis = fused_l1_dis[best_c].cpu().numpy().astype(np.float32)
+    print(f"  Spatial fused_l1: picked channel {best_c}/{fused_l1_shared.shape[0]}"
           f" (diff={float(chan_diffs[best_c]):.6f})")
 
     # ---- Upsample freq maps to match spatial/image resolution ----------
@@ -459,6 +512,27 @@ def main():
         area1 = list(map(int, AREA1))
         area2 = list(map(int, AREA2))
         print("Using manually-specified regions.")
+    elif SELECT_MODE == "interactive":
+        disp = cv2.cvtColor(r["vis_rgb"], cv2.COLOR_RGB2BGR)
+        print("\n🖱  Draw TWO boxes on the image:")
+        print("     Box 1 → Area1: degradation / frequency")
+        print("     Box 2 → Area2: fusion / spatial")
+        print("   Draw rectangle, press ENTER (or SPACE) to confirm.")
+        print("   Press ESC to cancel.\n")
+
+        r1 = cv2.selectROI("Area1 — draw, press ENTER", disp, showCrosshair=True)
+        if r1[2] == 0 or r1[3] == 0:
+            cv2.destroyAllWindows()
+            raise RuntimeError("Area1 cancelled or empty.")
+        area1 = [int(r1[0]), int(r1[1]), int(r1[0] + r1[2]), int(r1[1] + r1[3])]
+        print(f"  Area1: {area1}")
+
+        r2 = cv2.selectROI("Area2 — draw, press ENTER", disp, showCrosshair=True)
+        cv2.destroyAllWindows()
+        if r2[2] == 0 or r2[3] == 0:
+            raise RuntimeError("Area2 cancelled or empty.")
+        area2 = [int(r2[0]), int(r2[1]), int(r2[0] + r2[2]), int(r2[1] + r2[3])]
+        print(f"  Area2: {area2}")
     else:
         ws_freq = WINDOW_SIZE or min(100, min(H, W) // 4)
         ws_freq = int(min(ws_freq, H, W))
@@ -467,10 +541,24 @@ def main():
         md = MIN_DISTANCE or ws_freq * 1.2
         print(f"Auto-detect: freq_window={ws_freq}×{ws_freq}  spa_window={ws_spa}×{ws_spa}"
               f"  min_dist={md:.0f}")
-        area1, area2 = find_best_regions(
+        area1, area2, scores = find_best_regions(
             r["raw_diff_freq"], r["raw_diff_spa"], r["vis_rgb"],
             ws_freq, ws_spa, float(md))
         print("Regions selected.")
+
+        # Diagnostic: save score maps so you can inspect what the algorithm sees
+        for key, cmap in (
+            ("freq_scores", "inferno"), ("dark_scores", "gray_r"),
+            ("freq_dark", "inferno"),
+            ("spat_scores", "inferno"), ("text_scores", "Greens"),
+            ("bright_scores", "gray"), ("spa_texture", "inferno"),
+        ):
+            save_map(
+                normalize_single(scores[key]),
+                out_dir / f"diagnostic_{key}.png",
+                out_dir / f"diagnostic_{key}.npy",
+                cmap,
+            )
 
     print(f"  Area1 (freq/degradation): {area1}")
     print(f"  Area2 (spatial/fusion):    {area2}")
@@ -479,14 +567,18 @@ def main():
     draw_boxes(r["vis_rgb"], r["ir_gray"], area1, area2, out_dir)
 
     # ---- cropped feature panels (the 4 main components) ----------------
+    # Resize all crops to the same pixel size for uniform output.
+    OUT_SIZE = 400
     for name, src_map, cmap, cbar_label in (
         ("without_area1_freq", r["map_freq_shared"], COLORMAP_FREQ, "Freq activation"),
         ("with_area1_freq",    r["map_freq_dis"],    COLORMAP_FREQ, "Freq activation"),
-        ("without_area2_spa",  r["map_spa_shared"],  COLORMAP_SPATIAL, "IR preference"),
-        ("with_area2_spa",     r["map_spa_dis"],     COLORMAP_SPATIAL, "IR preference"),
+        ("without_area2_spa",  r["map_spa_shared"],  COLORMAP_SPATIAL, "Spatial activation"),
+        ("with_area2_spa",     r["map_spa_dis"],     COLORMAP_SPATIAL, "Spatial activation"),
     ):
         area = area1 if "area1" in name else area2
-        save_map(crop_map(src_map, area),
+        crop = crop_map(src_map, area)
+        crop = cv2.resize(crop, (OUT_SIZE, OUT_SIZE), interpolation=cv2.INTER_NEAREST)
+        save_map(crop,
                  out_dir / f"{name}.png", out_dir / f"{name}.npy", cmap,
                  colorbar=True, label=cbar_label)
 

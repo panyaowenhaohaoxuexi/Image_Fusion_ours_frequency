@@ -129,8 +129,8 @@ class PairedValidationDataset(Dataset):
             )
 
         # Already uint8 [0,255], no further quantization needed
-        metric_vis_u8 = torch.from_numpy(metric_vis_np.copy()).unsqueeze(0).unsqueeze(0)
-        metric_ir_u8 = torch.from_numpy(metric_ir_np.copy()).unsqueeze(0).unsqueeze(0)
+        metric_vis_u8 = torch.from_numpy(metric_vis_np.copy()).unsqueeze(0)
+        metric_ir_u8 = torch.from_numpy(metric_ir_np.copy()).unsqueeze(0)
 
         return (data_vis_y, data_ir, data_vis_rgb_raw,
                 metric_vis_u8, metric_ir_u8, filename)

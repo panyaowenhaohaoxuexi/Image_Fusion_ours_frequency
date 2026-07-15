@@ -28,7 +28,6 @@ from config import (
     METRIC_WEIGHTS,
     MIN_LR,
     MODEL_DIRECTORY,
-    MODEL_VERSION,
     TRAIN_H5_PATH,
     USE_CLIP_IMAGE_QUERY,
     VAL_BASELINE_CHECKPOINT,
@@ -39,6 +38,7 @@ from config import (
     VAL_VISIBLE_RGB_DIR,
     WARMUP_EPOCHS,
     WEIGHT_DECAY,
+    validate_runtime_config,
 )
 from net.Network import (
     DualDomainTextIntentGenerator,
@@ -65,6 +65,10 @@ from utils.training_utils import (
     compute_validation_score,
     get_frequency_weight,
     init_csv,
+    load_modules_from_checkpoint,
+    save_checkpoint,
+    should_update_best,
+    validate_checkpoint_metadata,
 )
 from utils.val_metrics import compute_val_metrics
 from utils.validation_dataset import PairedValidationDataset
@@ -111,74 +115,6 @@ def build_model(device: torch.device):
     return encoder, intent_generator, frequency_fusion, frequency_pyramid_adapter, spatial_fusion, fsrc_l1, fsrc_l2, fsrc_l3, fusion_decoder
 
 
-def unwrap(module):
-    return module.module if isinstance(module, nn.DataParallel) else module
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint helpers
-# ---------------------------------------------------------------------------
-
-_MODEL_KEYS = (
-    'shared_encoder', 'intent_generator', 'frequency_fusion', 'frequency_pyramid_adapter',
-    'spatial_fusion', 'fsrc_l1', 'fsrc_l2', 'fsrc_l3', 'fusion_decoder',
-)
-
-
-def save_checkpoint(
-    path,
-    modules,
-    optimizer=None, scheduler=None,
-    epoch=None, val_score=None, val_metrics=None, val_ratios=None,
-    is_best=False,
-):
-    checkpoint = {
-        'model_version': MODEL_VERSION,
-        'use_clip_image_query': USE_CLIP_IMAGE_QUERY,
-        'intent_generator_type': type(unwrap(modules[1])).__name__,
-    }
-    for key, module in zip(_MODEL_KEYS, modules):
-        checkpoint[key] = module.state_dict()
-
-    if optimizer is not None:
-        checkpoint['optimizer'] = optimizer.state_dict()
-    if scheduler is not None:
-        checkpoint['scheduler'] = scheduler.state_dict()
-    if epoch is not None:
-        checkpoint['epoch'] = int(epoch)
-    if val_score is not None:
-        checkpoint['val_score'] = float(val_score)
-    if val_metrics is not None:
-        checkpoint['val_metrics'] = dict(val_metrics)
-    if val_ratios is not None:
-        checkpoint['val_ratios'] = dict(val_ratios)
-    checkpoint['is_best'] = bool(is_best)
-
-    # Atomic write
-    tmp_path = path + ".tmp"
-    torch.save(checkpoint, tmp_path)
-    os.replace(tmp_path, path)
-
-
-def validate_checkpoint_metadata(checkpoint, intent_generator):
-    """Reuse test.py metadata validation."""
-    expected_type = type(unwrap(intent_generator)).__name__
-    if checkpoint.get('model_version') != MODEL_VERSION:
-        raise RuntimeError('Checkpoint model version mismatch.')
-    if checkpoint.get('use_clip_image_query') != USE_CLIP_IMAGE_QUERY:
-        raise RuntimeError('Checkpoint query variant mismatch.')
-    if checkpoint.get('intent_generator_type') != expected_type:
-        raise RuntimeError('Checkpoint intent generator type mismatch.')
-
-
-def load_modules_from_checkpoint(modules, checkpoint):
-    """Strict load with all keys required."""
-    for key, module in zip(_MODEL_KEYS, modules):
-        if key not in checkpoint:
-            raise KeyError(f"Checkpoint missing key: {key}")
-        module.load_state_dict(checkpoint[key], strict=True)
-
-
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -195,7 +131,8 @@ def run_validation(modules, valloader, device):
 
         with torch.no_grad():
             for (data_vis, data_ir, data_vis_rgb_raw,
-                 metric_vis_u8, metric_ir_u8, _) in valloader:
+                 metric_vis_u8, metric_ir_u8, filenames) in valloader:
+                filename = filenames[0]
                 data_vis = data_vis.to(device)
                 data_ir = data_ir.to(device)
                 data_vis_clip = preprocess_clip_rgb(data_vis_rgb_raw.to(device))
@@ -217,12 +154,21 @@ def run_validation(modules, valloader, device):
                     ir_u8=metric_ir_u8,
                 )
                 for k in METRIC_WEIGHTS:
-                    all_metrics[k].append(metrics[k])
+                    if k not in metrics:
+                        raise KeyError(f"Validation metric {k} missing for {filename}")
+                    value = float(metrics[k])
+                    if not math.isfinite(value):
+                        raise FloatingPointError(
+                            f"Validation metric {k} is not finite for {filename}: {value}"
+                        )
+                    all_metrics[k].append(value)
 
     finally:
         for m, mode in zip(modules, previous_modes):
             m.train(mode)
 
+    if any(len(values) == 0 for values in all_metrics.values()):
+        raise RuntimeError("Validation loader produced no metric results.")
     avg_metrics = {k: float(sum(v) / len(v)) for k, v in all_metrics.items()}
     return avg_metrics
 
@@ -391,6 +337,7 @@ def training_forward(modules, data_vis, data_ir, data_vis_clip):
 # ---------------------------------------------------------------------------
 
 def main():
+    validate_runtime_config()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # --- Validation dataset (used for both baseline and per-epoch validation) ---
@@ -605,14 +552,8 @@ def main():
               f"score={val_score:.6f} worst_ratio={worst_ratio:.4f}")
 
         # --- Determine best ---
-        finite_validation = (
-            math.isfinite(val_score)
-            and all(math.isfinite(float(v)) for v in val_metrics.values())
-        )
-
-        is_best = False
-        if finite_validation and val_score > best_val_score:
-            is_best = True
+        is_best = should_update_best(val_score, best_val_score, val_metrics)
+        if is_best:
             best_val_score = val_score
             best_epoch = epoch + 1
             best_metrics = dict(val_metrics)
@@ -629,11 +570,14 @@ def main():
             print(f"[Best] epoch={best_epoch} score={best_val_score:.6f} "
                   f"metrics={best_metrics} ratios={best_ratios}")
             print(f"[Best] saved to {best_checkpoint_path}")
-        elif not finite_validation:
+        elif not math.isfinite(float(val_score)) or not all(
+            math.isfinite(float(value)) for value in val_metrics.values()
+        ):
             print(f"[WARNING] Validation metrics non-finite (val_score={val_score}), "
                   f"skipping best checkpoint update.")
 
-        # Always save latest
+        # Always save latest: it is manually restorable for a future resume workflow;
+        # this main() path intentionally continues to train from scratch.
         save_checkpoint(
             path=latest_checkpoint_path,
             modules=modules,

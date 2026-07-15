@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
+import importlib
 import json
 import math
 import os
+import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -13,9 +17,14 @@ from PIL import Image
 
 from utils.loss import CorrelationConsistencyLoss, LocalContrastLoss, cc
 from utils.training_utils import (
+    _MODEL_KEYS,
     build_lr_scheduler,
     compute_validation_score,
     get_frequency_weight,
+    load_modules_from_checkpoint,
+    save_checkpoint,
+    should_update_best,
+    validate_checkpoint_metadata,
 )
 from utils.val_metrics import _quantize_to_uint8, _validate_source_uint8, compute_val_metrics
 from utils.validation_dataset import PairedValidationDataset
@@ -124,6 +133,47 @@ class LocalContrastLossTests(unittest.TestCase):
         criterion = LocalContrastLoss(window_size=5)
         self.assertEqual(criterion.window_size, 5)
 
+    def test_window_seven_accepts_four_by_four_input(self):
+        criterion = LocalContrastLoss(window_size=7)
+        image = torch.randn(1, 1, 4, 4)
+        self.assertTrue(torch.isfinite(criterion._local_std(image)).all().item())
+
+    def test_window_seven_rejects_reflect_padding_on_three_by_three_input(self):
+        criterion = LocalContrastLoss(window_size=7)
+        with self.assertRaisesRegex(
+            ValueError, "^Input spatial size \(3, 3\) must be larger than reflect padding 3\.$"
+        ):
+            criterion._local_std(torch.randn(1, 1, 3, 3))
+
+    def test_local_std_rejects_non_four_dimensional_input(self):
+        criterion = LocalContrastLoss(window_size=7)
+        with self.assertRaisesRegex(
+            ValueError, "^LocalContrastLoss expects input with shape \(N, C, H, W\)\.$"
+        ):
+            criterion._local_std(torch.randn(1, 4, 4))
+
+
+class CorrelationCoefficientTests(unittest.TestCase):
+    def test_float32_and_float64_inputs_are_finite(self):
+        for dtype in (torch.float32, torch.float64):
+            left = torch.randn(1, 1, 8, 8, dtype=dtype)
+            right = torch.randn(1, 1, 8, 8, dtype=dtype)
+            self.assertTrue(torch.isfinite(cc(left, right)).item())
+
+    def test_integer_inputs_are_rejected(self):
+        right = torch.rand(1, 1, 8, 8)
+        for dtype in (torch.int32, torch.uint8):
+            with self.assertRaisesRegex(TypeError, "floating-point"):
+                cc(torch.ones(1, 1, 8, 8, dtype=dtype), right)
+            with self.assertRaisesRegex(TypeError, "floating-point"):
+                cc(right, torch.ones(1, 1, 8, 8, dtype=dtype))
+
+    def test_shape_and_dimension_errors_remain_value_errors(self):
+        with self.assertRaises(ValueError):
+            cc(torch.rand(1, 1, 8, 8), torch.rand(1, 1, 7, 8))
+        with self.assertRaisesRegex(ValueError, "shape \(N, C, H, W\)"):
+            cc(torch.rand(1, 8, 8), torch.rand(1, 8, 8))
+
 
 # ---------------------------------------------------------------------------
 # 8.3 FrequencyWarmupTests
@@ -228,9 +278,41 @@ class ValidationDatasetTests(unittest.TestCase):
             data_vis_y, data_ir, data_vis_rgb_raw, metric_vis_u8, metric_ir_u8, fname = ds[0]
             self.assertEqual(metric_vis_u8.dtype, torch.uint8)
             self.assertEqual(metric_ir_u8.dtype, torch.uint8)
-            self.assertEqual(metric_vis_u8.ndim, 4)
+            self.assertEqual(metric_vis_u8.ndim, 3)
             self.assertEqual(metric_vis_u8.shape[0], 1)
-            self.assertEqual(metric_vis_u8.shape[1], 1)
+            self.assertEqual(metric_ir_u8.shape[0], 1)
+            self.assertEqual(metric_vis_u8.shape[-2:], (32, 32))
+            self.assertEqual(metric_ir_u8.shape[-2:], (32, 32))
+
+    def test_textured_pair_dataloader_metrics_are_four_dimensional_and_finite(self):
+        """Metric source images gain the batch dimension exactly once in DataLoader."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rng = np.random.RandomState(123)
+            vis_dir = os.path.join(tmpdir, "visible")
+            ir_dir = os.path.join(tmpdir, "infrared")
+            os.makedirs(vis_dir)
+            os.makedirs(ir_dir)
+            height, width = 64, 64
+            yy, xx = np.mgrid[:height, :width]
+            texture = ((xx * 11 + yy * 17) % 256).astype(np.uint8)
+            vis_rgb = np.stack((texture, rng.randint(0, 256, (height, width), dtype=np.uint8),
+                                np.roll(texture, 7, axis=1)), axis=-1)
+            ir = ((texture.astype(np.uint16) + rng.randint(0, 64, (height, width))) % 256).astype(np.uint8)
+            Image.fromarray(vis_rgb).save(os.path.join(vis_dir, "0000.png"))
+            Image.fromarray(ir).save(os.path.join(ir_dir, "0000.png"))
+
+            dataset = PairedValidationDataset(vis_dir, ir_dir, expected_pairs=1)
+            loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
+            _, _, _, metric_vis_u8, metric_ir_u8, _ = next(iter(loader))
+            self.assertEqual(metric_vis_u8.shape, (1, 1, height, width))
+            self.assertEqual(metric_ir_u8.shape, (1, 1, height, width))
+            self.assertEqual(metric_vis_u8.dtype, torch.uint8)
+            self.assertEqual(metric_ir_u8.dtype, torch.uint8)
+
+            fused = torch.from_numpy(rng.uniform(0.05, 0.95, (1, 1, height, width)).astype(np.float32))
+            metrics = compute_val_metrics(fused, metric_vis_u8, metric_ir_u8)
+            self.assertEqual(set(metrics), {"EN", "SD", "SCD", "VIF", "QABF", "MI"})
+            self.assertTrue(all(math.isfinite(float(value)) for value in metrics.values()))
 
     def test_wrong_count(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -341,39 +423,21 @@ class ValidationScoreTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class BestCheckpointTests(unittest.TestCase):
-    def test_best_logic_mock(self):
-        """Mock test: verify is_best flag logic without actual checkpoint I/O."""
-        # The logic: is_best = finite_validation and val_score > best_val_score
-        # - NaN val_score: is_best = False
-        # - Decreasing score: is_best = False
-        # - Increasing score (finite): is_best = True
+    valid_metrics = {"EN": 7.0, "SD": 40.0, "SCD": 1.6, "VIF": 1.0, "QABF": 0.7, "MI": 3.6}
 
-        best_val_score = -float("inf")
-
-        # First valid score -> best
-        val_score = 1.0
-        finite = math.isfinite(val_score) and True
-        is_best = finite and val_score > best_val_score
-        self.assertTrue(is_best)
-        best_val_score = val_score
-
-        # Lower score -> not best
-        val_score = 0.9
-        finite = math.isfinite(val_score) and True
-        is_best = finite and val_score > best_val_score
-        self.assertFalse(is_best)
-
-        # NaN -> not best
-        val_score = float("nan")
-        finite = math.isfinite(val_score) and True
-        is_best = finite and val_score > best_val_score
-        self.assertFalse(is_best)
-
-        # Higher score -> best
-        val_score = 1.1
-        finite = math.isfinite(val_score) and True
-        is_best = finite and val_score > best_val_score
-        self.assertTrue(is_best)
+    def test_should_update_best_rejects_invalid_or_non_improving_scores(self):
+        self.assertFalse(should_update_best(1.0, 0.0, {}))
+        self.assertTrue(should_update_best(1.0, 0.0, self.valid_metrics))
+        self.assertFalse(should_update_best(1.0, 1.0, self.valid_metrics))
+        self.assertFalse(should_update_best(0.9, 1.0, self.valid_metrics))
+        for value in (float("nan"), float("inf"), -float("inf")):
+            self.assertFalse(should_update_best(value, 0.0, self.valid_metrics))
+        self.assertFalse(should_update_best(1.0, float("nan"), self.valid_metrics))
+        self.assertFalse(should_update_best(1.0, float("inf"), self.valid_metrics))
+        self.assertTrue(should_update_best(1.0, -float("inf"), self.valid_metrics))
+        for invalid_metric in (float("nan"), float("inf"), -float("inf")):
+            metrics = dict(self.valid_metrics, EN=invalid_metric)
+            self.assertFalse(should_update_best(1.0, 0.0, metrics))
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +445,21 @@ class BestCheckpointTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class ValMetricsRoundTripTests(unittest.TestCase):
+    def _assert_finite_metrics(self, fused_device: torch.device):
+        rng = np.random.RandomState(99)
+        image = torch.from_numpy(rng.uniform(0.05, 0.95, (1, 1, 64, 64)).astype(np.float32)).to(fused_device)
+        vis = torch.from_numpy(rng.randint(0, 256, (1, 1, 64, 64), dtype=np.uint8))
+        ir = torch.from_numpy(rng.randint(0, 256, (1, 1, 64, 64), dtype=np.uint8))
+        metrics = compute_val_metrics(image, vis, ir)
+        self.assertTrue(all(isinstance(value, float) and math.isfinite(value) for value in metrics.values()))
+
+    def test_cpu_metrics_are_finite(self):
+        self._assert_finite_metrics(torch.device("cpu"))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+    def test_cuda_metrics_are_finite(self):
+        self._assert_finite_metrics(torch.device("cuda"))
+
     def test_round_trip_consistency(self):
         """Verify compute_val_metrics matches disk-based metric evaluation."""
         from metric.Metric_torch import (
@@ -472,6 +551,149 @@ class ValMetricsRoundTripTests(unittest.TestCase):
 # ModeRecoveryTests
 # ---------------------------------------------------------------------------
 
+class CheckpointUtilitiesTests(unittest.TestCase):
+    class DummyModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.Linear(2, 2)
+
+    def _modules(self):
+        self.assertEqual(len(_MODEL_KEYS), 9)
+        return [self.DummyModule() for _ in _MODEL_KEYS]
+
+    def _optimizer_and_scheduler(self, modules):
+        optimizer = torch.optim.SGD(
+            [parameter for module in modules for parameter in module.parameters()], lr=0.1
+        )
+        return optimizer, torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+
+    def _checkpoint_metadata(self, intent_generator):
+        from config import MODEL_VERSION, USE_CLIP_IMAGE_QUERY
+        return {
+            "model_version": MODEL_VERSION,
+            "use_clip_image_query": USE_CLIP_IMAGE_QUERY,
+            "intent_generator_type": type(intent_generator).__name__,
+        }
+
+    def test_save_checkpoint_is_atomic_complete_and_overwritable(self):
+        modules = self._modules()
+        optimizer, scheduler = self._optimizer_and_scheduler(modules)
+        metrics = {"EN": 7.0, "SD": 40.0, "SCD": 1.6, "VIF": 1.0, "QABF": 0.7, "MI": 3.6}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "nested", "latest.pth")
+            save_checkpoint(path, modules, optimizer, scheduler, epoch=1, val_score=1.0,
+                            val_metrics=metrics, val_ratios={"EN": 1.0}, is_best=False)
+            self.assertTrue(os.path.isfile(path))
+            self.assertFalse(os.path.exists(path + ".tmp"))
+            first = torch.load(path, map_location="cpu")
+            self.assertTrue(set(_MODEL_KEYS).issubset(first))
+            self.assertTrue({"model_version", "use_clip_image_query", "intent_generator_type", "epoch",
+                             "val_score", "val_metrics", "val_ratios", "optimizer", "scheduler", "is_best"}.issubset(first))
+            self.assertEqual(first["epoch"], 1)
+            save_checkpoint(path, modules, optimizer, scheduler, epoch=2, val_score=1.1,
+                            val_metrics=metrics, val_ratios={"EN": 1.1}, is_best=False)
+            self.assertFalse(os.path.exists(path + ".tmp"))
+            self.assertEqual(torch.load(path, map_location="cpu")["epoch"], 2)
+
+    def test_save_checkpoint_rejects_wrong_module_counts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "checkpoint.pth")
+            for count in (len(_MODEL_KEYS) - 1, len(_MODEL_KEYS) + 1):
+                with self.assertRaisesRegex(
+                    ValueError, f"Expected exactly {len(_MODEL_KEYS)} modules, got {count}\."
+                ):
+                    save_checkpoint(path, self._modules()[:count] if count < len(_MODEL_KEYS)
+                                    else self._modules() + [self.DummyModule()])
+
+    def test_save_checkpoint_cleans_temp_file_when_replace_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "checkpoint.pth")
+            original = b"existing checkpoint"
+            with open(path, "wb") as file:
+                file.write(original)
+            with mock.patch("utils.training_utils.os.replace", side_effect=OSError("replace failed")):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    save_checkpoint(path, self._modules())
+            with open(path, "rb") as file:
+                self.assertEqual(file.read(), original)
+            self.assertFalse(os.path.exists(path + ".tmp"))
+
+    def test_load_modules_requires_complete_strict_matching_states(self):
+        source = self._modules()
+        checkpoint = {key: module.state_dict() for key, module in zip(_MODEL_KEYS, source)}
+        restored = self._modules()
+        load_modules_from_checkpoint(restored, checkpoint)
+        for expected, actual in zip(source, restored):
+            for expected_parameter, actual_parameter in zip(expected.parameters(), actual.parameters()):
+                self.assertTrue(torch.equal(expected_parameter, actual_parameter))
+
+        missing = dict(checkpoint)
+        del missing[_MODEL_KEYS[0]]
+        with self.assertRaises(KeyError):
+            load_modules_from_checkpoint(self._modules(), missing)
+
+        wrong_name = dict(checkpoint)
+        wrong_name[_MODEL_KEYS[0]] = {"unknown.weight": torch.zeros(2, 2)}
+        with self.assertRaises(RuntimeError):
+            load_modules_from_checkpoint(self._modules(), wrong_name)
+
+        wrong_shape = dict(checkpoint)
+        wrong_shape[_MODEL_KEYS[0]] = {"layer.weight": torch.zeros(3, 2), "layer.bias": torch.zeros(2)}
+        with self.assertRaises(RuntimeError):
+            load_modules_from_checkpoint(self._modules(), wrong_shape)
+
+    def test_load_modules_rejects_wrong_destination_module_counts(self):
+        checkpoint = {
+            key: module.state_dict()
+            for key, module in zip(_MODEL_KEYS, self._modules())
+        }
+        for count in (len(_MODEL_KEYS) - 1, len(_MODEL_KEYS) + 1):
+            modules = self._modules()[:count] if count < len(_MODEL_KEYS) else self._modules() + [self.DummyModule()]
+            with self.assertRaisesRegex(
+                ValueError, f"Expected exactly {len(_MODEL_KEYS)} modules, got {count}\."
+            ):
+                load_modules_from_checkpoint(modules, checkpoint)
+
+    def test_validate_checkpoint_metadata_rejects_wrong_or_missing_fields(self):
+        intent_generator = self.DummyModule()
+        valid = self._checkpoint_metadata(intent_generator)
+        validate_checkpoint_metadata(valid, intent_generator)
+        for key, bad_value in (
+            ("model_version", "wrong-version"),
+            ("use_clip_image_query", not valid["use_clip_image_query"]),
+            ("intent_generator_type", "OtherIntent"),
+        ):
+            bad = dict(valid, **{key: bad_value})
+            with self.assertRaises(RuntimeError):
+                validate_checkpoint_metadata(bad, intent_generator)
+        for key in tuple(valid):
+            missing = dict(valid)
+            del missing[key]
+            with self.assertRaises(RuntimeError):
+                validate_checkpoint_metadata(missing, intent_generator)
+
+    def test_only_true_best_decision_replaces_best_file(self):
+        modules = self._modules()
+        metrics = {"EN": 7.0, "SD": 40.0, "SCD": 1.6, "VIF": 1.0, "QABF": 0.7, "MI": 3.6}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "best.pth")
+            save_checkpoint(path, modules, epoch=1, val_score=1.0, val_metrics=metrics, is_best=True)
+            original_epoch = torch.load(path, map_location="cpu")["epoch"]
+            rejected = [
+                (1.0, 1.0, metrics), (0.9, 1.0, metrics), (float("nan"), 1.0, metrics),
+                (float("inf"), 1.0, metrics), (1.1, float("inf"), metrics),
+                (1.1, 1.0, dict(metrics, EN=float("nan"))),
+            ]
+            for score, best_score, candidate_metrics in rejected:
+                if should_update_best(score, best_score, candidate_metrics):
+                    save_checkpoint(path, modules, epoch=2, val_score=score,
+                                    val_metrics=candidate_metrics, is_best=True)
+            self.assertEqual(torch.load(path, map_location="cpu")["epoch"], original_epoch)
+            self.assertTrue(should_update_best(1.1, 1.0, metrics))
+            save_checkpoint(path, modules, epoch=2, val_score=1.1, val_metrics=metrics, is_best=True)
+            self.assertEqual(torch.load(path, map_location="cpu")["epoch"], 2)
+
+
 class ModeRecoveryTests(unittest.TestCase):
     def test_training_mode_restore(self):
         """Verify try/finally pattern restores training mode."""
@@ -497,6 +719,52 @@ class ModeRecoveryTests(unittest.TestCase):
                 m.train(mode)
 
         self.assertTrue(all(m.training for m in modules))
+
+
+class RunValidationTests(unittest.TestCase):
+    def test_empty_loader_raises_approved_runtime_error(self):
+        missing = object()
+        previous_train = sys.modules.get("train", missing)
+        previous_clip = sys.modules.get("clip", missing)
+        previous_net_modules = {
+            name: module
+            for name, module in sys.modules.items()
+            if name == "net" or name.startswith("net.")
+        }
+        sys.modules.pop("train", None)
+        clip_stub = types.ModuleType("clip")
+        sys.modules["clip"] = clip_stub
+        try:
+            train_module = importlib.import_module("train")
+            empty_loader = torch.utils.data.DataLoader([], batch_size=1)
+            modules = [nn.Identity() for _ in range(9)]
+            with self.assertRaisesRegex(
+                RuntimeError, r"^Validation loader produced no metric results\.$"
+            ):
+                train_module.run_validation(modules, empty_loader, torch.device("cpu"))
+        finally:
+            for name in list(sys.modules):
+                if (name == "net" or name.startswith("net.")) and name not in previous_net_modules:
+                    sys.modules.pop(name, None)
+            sys.modules.update(previous_net_modules)
+            if previous_train is missing:
+                sys.modules.pop("train", None)
+            else:
+                sys.modules["train"] = previous_train
+            if previous_clip is missing:
+                sys.modules.pop("clip", None)
+            else:
+                sys.modules["clip"] = previous_clip
+        self.assertEqual(
+            {
+                name: module
+                for name, module in sys.modules.items()
+                if name == "net" or name.startswith("net.")
+            },
+            previous_net_modules,
+        )
+        self.assertIs(sys.modules.get("train", missing), previous_train)
+        self.assertIs(sys.modules.get("clip", missing), previous_clip)
 
 
 if __name__ == "__main__":
