@@ -21,6 +21,9 @@ from config import (
     COEFF_FUSION,
     COEFF_LOCAL_CONTRAST,
     COEFF_SSIM,
+    DECODER_INNER_DIM,
+    DECODER_MAX_RESIDUAL_SCALE,
+    DECODER_NUM_BLOCKS,
     FREQUENCY_WARMUP_EPOCHS,
     GLOBAL_GRAD_CLIP,
     METRIC_WEIGHTS,
@@ -107,7 +110,8 @@ def build_model(device: torch.device):
     fsrc_l2 = nn.DataParallel(FSRC(channels=64)).to(device)
     fsrc_l3 = nn.DataParallel(FSRC(channels=64)).to(device)
     fusion_decoder = nn.DataParallel(FusionDecoder(
-        channels=64, out_channels=1, inner_dim=24, num_blocks=1, num_heads=1, ffn_expansion_factor=2.0,
+        channels=64, out_channels=1, inner_dim=DECODER_INNER_DIM, num_blocks=DECODER_NUM_BLOCKS,
+        max_residual_scale=DECODER_MAX_RESIDUAL_SCALE, num_heads=1, ffn_expansion_factor=2.0,
     )).to(device)
     return encoder, intent_generator, frequency_fusion, frequency_pyramid_adapter, spatial_fusion, fsrc_l1, fsrc_l2, fsrc_l3, fusion_decoder
 
@@ -138,12 +142,15 @@ def run_validation(modules, valloader, device):
                 ir_spa, ir_freq, _ = modules[0](data_ir)
                 i_deg, i_fus, _ = modules[1](data_vis_clip, vis_spa, ir_spa, vis_freq, ir_freq)
                 fused_freq, _ = modules[2](vis_freq, ir_freq, frequency_intent=i_deg)
-                _, spatial_pyramid, _ = modules[4](vis_spa, ir_spa, i_fus, return_aux=True, return_pyramid=True)
+                _, spatial_pyramid, spatial_aux = modules[4](vis_spa, ir_spa, i_fus, return_aux=True, return_pyramid=True)
                 freq_pyramid = modules[3](fused_freq, target_pyramid=spatial_pyramid)
                 d_l1, _ = modules[5](freq_pyramid['l1'], spatial_pyramid['l1'])
                 d_l2, _ = modules[6](freq_pyramid['l2'], spatial_pyramid['l2'])
                 d_l3, _ = modules[7](freq_pyramid['l3'], spatial_pyramid['l3'])
-                fused_image, _ = modules[8](d_l1, d_l2, d_l3)
+                fused_image, _ = modules[8](
+                    d_l1, d_l2, d_l3, image_vis=data_vis, image_ir=data_ir,
+                    weight_ir=spatial_aux['weight_multiscale'],
+                )
 
                 metrics = compute_val_metrics(
                     fused=fused_image,
@@ -183,12 +190,15 @@ def training_forward(modules, data_vis, data_ir, data_vis_clip):
     ir_spa, ir_freq, _ = shared_encoder(data_ir)
     i_deg, i_fus, _ = intent_generator(data_vis_clip, vis_spa, ir_spa, vis_freq, ir_freq)
     fused_freq, _ = frequency_fusion(vis_freq, ir_freq, frequency_intent=i_deg)
-    _, spatial_pyramid, _ = spatial_fusion(vis_spa, ir_spa, i_fus, return_aux=True, return_pyramid=True)
+    _, spatial_pyramid, spatial_aux = spatial_fusion(vis_spa, ir_spa, i_fus, return_aux=True, return_pyramid=True)
     freq_pyramid = frequency_pyramid_adapter(fused_freq, target_pyramid=spatial_pyramid)
     d_l1, _ = fsrc_l1(freq_pyramid['l1'], spatial_pyramid['l1'])
     d_l2, _ = fsrc_l2(freq_pyramid['l2'], spatial_pyramid['l2'])
     d_l3, _ = fsrc_l3(freq_pyramid['l3'], spatial_pyramid['l3'])
-    fused_image, _ = fusion_decoder(d_l1, d_l2, d_l3)
+    fused_image, _ = fusion_decoder(
+        d_l1, d_l2, d_l3, image_vis=data_vis, image_ir=data_ir,
+        weight_ir=spatial_aux['weight_multiscale'],
+    )
 
     return fused_image
 
@@ -200,6 +210,10 @@ def training_forward(modules, data_vis, data_ir, data_vis_clip):
 def main():
     validate_runtime_config()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(
+        f'[Model] version={CHECKPOINT_TAG} decoder_inner_dim={DECODER_INNER_DIM} '
+        f'decoder_num_blocks={DECODER_NUM_BLOCKS} decoder_max_residual_scale={DECODER_MAX_RESIDUAL_SCALE}'
+    )
 
     # --- Fixed validation dataset ---
     val_dataset = PairedValidationDataset(
@@ -208,7 +222,7 @@ def main():
         visible_rgb_dir=VAL_VISIBLE_RGB_DIR,
         expected_pairs=VAL_EXPECTED_PAIRS,
     )
-    valloader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0,
+    valloader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=8,
                            pin_memory=torch.cuda.is_available())
 
     # --- Loss criteria ---

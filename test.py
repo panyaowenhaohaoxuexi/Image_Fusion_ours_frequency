@@ -12,6 +12,9 @@ from config import (
     CHECKPOINT_TAG,
     CLIP_DOWNLOAD_ROOT,
     CLIP_MODEL_NAME,
+    DECODER_INNER_DIM,
+    DECODER_MAX_RESIDUAL_SCALE,
+    DECODER_NUM_BLOCKS,
     MODEL_DIRECTORY,
     MODEL_VERSION,
     USE_CLIP_IMAGE_QUERY,
@@ -64,7 +67,8 @@ def build_model(device):
     fsrc_l2 = nn.DataParallel(FSRC(channels=64)).to(device)
     fsrc_l3 = nn.DataParallel(FSRC(channels=64)).to(device)
     fusion_decoder = nn.DataParallel(FusionDecoder(
-        channels=64, out_channels=1, inner_dim=24, num_blocks=1, num_heads=1, ffn_expansion_factor=2.0,
+        channels=64, out_channels=1, inner_dim=DECODER_INNER_DIM, num_blocks=DECODER_NUM_BLOCKS,
+        max_residual_scale=DECODER_MAX_RESIDUAL_SCALE, num_heads=1, ffn_expansion_factor=2.0,
     )).to(device)
     return encoder, intent_generator, frequency_fusion, frequency_pyramid_adapter, spatial_fusion, fsrc_l1, fsrc_l2, fsrc_l3, fusion_decoder
 
@@ -95,6 +99,10 @@ def normalize_to_uint8(tensor):
 
 def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(
+        f'[Model] version={MODEL_VERSION} decoder_inner_dim={DECODER_INNER_DIM} '
+        f'decoder_num_blocks={DECODER_NUM_BLOCKS} decoder_max_residual_scale={DECODER_MAX_RESIDUAL_SCALE}'
+    )
     if not os.path.isfile(CLIP_MODEL_NAME):
         raise FileNotFoundError(f'CLIP checkpoint not found: {CLIP_MODEL_NAME}')
     modules = build_model(device)
@@ -144,12 +152,15 @@ def main():
                 ir_spa, ir_freq, _ = encoder(data_ir)
                 i_deg, i_fus, _ = intent_generator(data_vis_clip, vis_spa, ir_spa, vis_freq, ir_freq)
                 fused_freq, _ = frequency_fusion(vis_freq, ir_freq, frequency_intent=i_deg)
-                _, spatial_pyramid, _ = spatial_fusion(vis_spa, ir_spa, i_fus, return_aux=True, return_pyramid=True)
+                _, spatial_pyramid, spatial_aux = spatial_fusion(vis_spa, ir_spa, i_fus, return_aux=True, return_pyramid=True)
                 freq_pyramid = frequency_pyramid_adapter(fused_freq, target_pyramid=spatial_pyramid)
                 d_l1, _ = fsrc_l1(freq_pyramid['l1'], spatial_pyramid['l1'])
                 d_l2, _ = fsrc_l2(freq_pyramid['l2'], spatial_pyramid['l2'])
                 d_l3, _ = fsrc_l3(freq_pyramid['l3'], spatial_pyramid['l3'])
-                data_fuse, _ = fusion_decoder(d_l1, d_l2, d_l3)
+                data_fuse, _ = fusion_decoder(
+                    d_l1, d_l2, d_l3, image_vis=data_vis, image_ir=data_ir,
+                    weight_ir=spatial_aux['weight_multiscale'],
+                )
                 fused_y = normalize_to_uint8(data_fuse)
                 save_name = os.path.splitext(img_name)[0]
                 img_save(fused_y, save_name, gray_out_folder)

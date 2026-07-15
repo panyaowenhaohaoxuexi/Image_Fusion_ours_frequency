@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from net.encoder.blocks import ResidualBlock
+from net.normalization import get_valid_group_count
 from net.restormer_light import TransformerBlock
 
 TensorOrPyramid = Union[torch.Tensor, Sequence[torch.Tensor]]
@@ -65,27 +66,75 @@ class SemanticAffineModulation(nn.Module):
 
 
 class PositionAdaptiveWeightGate(nn.Module):
-    """Single-channel IR gate conditioned on local VIS/IR features and I_fus."""
+    """Channel-spatial IR gate plus a learned image-level aggregation map.
+
+    The returned channel gate has shape ``[B, C, H, W]`` and is used for
+    latent feature fusion.  The auxiliary image gate has shape ``[B, 1, H, W]``
+    and is reserved for visualization and image reconstruction.
+    """
 
     def __init__(self, channels: int = 64, intent_dim: int = 64):
         super().__init__()
+        hidden = max(channels // 4, 8)
+        groups = get_valid_group_count(channels)
+        self.vis_gate_norm = nn.GroupNorm(groups, channels)
+        self.ir_gate_norm = nn.GroupNorm(groups, channels)
+        self.channel_mlp = nn.Sequential(
+            nn.Conv2d(channels * 4, hidden, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden, channels, 1),
+        )
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(channels * 5, channels, 1),
+            nn.GroupNorm(groups, channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 3, padding=1, groups=channels),
+            nn.GroupNorm(groups, channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 1),
+        )
         self.intent_proj = nn.Sequential(
             nn.Linear(intent_dim, channels),
             nn.GELU(),
             nn.Linear(channels, channels),
         )
-        self.gate = nn.Sequential(
-            nn.Conv2d(channels * 3, channels, 3, 1, 1),
+        self.image_gate = nn.Sequential(
+            nn.Conv2d(channels, hidden, 1),
             nn.GELU(),
-            nn.Conv2d(channels, max(channels // 2, 1), 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(max(channels // 2, 1), 1, 1, 1, 0),
+            nn.Conv2d(hidden, 1, 1),
         )
+        for output_layer in (
+            self.channel_mlp[-1], self.spatial_gate[-1],
+            self.intent_proj[-1], self.image_gate[-1],
+        ):
+            nn.init.normal_(output_layer.weight, mean=0.0, std=1e-3)
+            if output_layer.bias is not None:
+                nn.init.zeros_(output_layer.bias)
 
-    def forward(self, vis_feat: torch.Tensor, ir_feat: torch.Tensor, spatial_intent: torch.Tensor) -> torch.Tensor:
+    def forward(self, vis_feat: torch.Tensor, ir_feat: torch.Tensor, spatial_intent: torch.Tensor):
         b, c, h, w = vis_feat.shape
+        vis_gate_feat = self.vis_gate_norm(vis_feat)
+        ir_gate_feat = self.ir_gate_norm(ir_feat)
+        modality_feature = torch.cat([
+            vis_gate_feat,
+            ir_gate_feat,
+            torch.abs(vis_gate_feat - ir_gate_feat),
+            vis_gate_feat * ir_gate_feat,
+        ], dim=1)
         intent_map = self.intent_proj(spatial_intent).view(b, c, 1, 1).expand(-1, -1, h, w)
-        return torch.sigmoid(self.gate(torch.cat([vis_feat, ir_feat, intent_map], dim=1)))
+        avg_descriptor = F.adaptive_avg_pool2d(modality_feature, 1)
+        max_descriptor = F.adaptive_max_pool2d(modality_feature, 1)
+        channel_logits = self.channel_mlp(avg_descriptor) + self.channel_mlp(max_descriptor)
+        spatial_logits = self.spatial_gate(torch.cat([modality_feature, intent_map], dim=1))
+        intent_logits = self.intent_proj(spatial_intent).view(b, c, 1, 1)
+        gate_logits = channel_logits + spatial_logits + intent_logits
+        weight_ir_channel = torch.sigmoid(gate_logits)
+        weight_ir_image = torch.sigmoid(self.image_gate(gate_logits))
+        return weight_ir_channel, {
+            'weight': weight_ir_image,
+            'weight_channel': weight_ir_channel,
+            'weight_channel_mean': weight_ir_channel.mean(dim=1, keepdim=True),
+        }
 
 
 class ShallowSemanticFusionBlock(nn.Module):
@@ -105,10 +154,10 @@ class ShallowSemanticFusionBlock(nn.Module):
     def forward(self, vis_feat: torch.Tensor, ir_feat: torch.Tensor, z_fus: torch.Tensor):
         vis_tilde = self.vis_mod(vis_feat, z_fus)
         ir_tilde = self.ir_mod(ir_feat, z_fus)
-        weight_ir = self.weight_gate(vis_tilde, ir_tilde, z_fus)
-        gated = weight_ir * ir_tilde + (1.0 - weight_ir) * vis_tilde
+        weight_ir_channel, gate_aux = self.weight_gate(vis_tilde, ir_tilde, z_fus)
+        gated = weight_ir_channel * ir_tilde + (1.0 - weight_ir_channel) * vis_tilde
         fused = self.fuse(gated)
-        return fused, {'vis_tilde': vis_tilde, 'ir_tilde': ir_tilde, 'weight': weight_ir}
+        return fused, {'vis_tilde': vis_tilde, 'ir_tilde': ir_tilde, **gate_aux}
 
 
 class DeepSemanticCrossModalFusionBlock(nn.Module):
@@ -156,8 +205,8 @@ class DeepSemanticCrossModalFusionBlock(nn.Module):
         ir_update = ir_update_t.transpose(0, 1)
         vis_hat = self._to_map(vis_tokens + vis_update, h, w)
         ir_hat = self._to_map(ir_tokens + ir_update, h, w)
-        weight_ir = self.weight_gate(vis_hat, ir_hat, z_fus)
-        gated = weight_ir * ir_hat + (1.0 - weight_ir) * vis_hat
+        weight_ir_channel, gate_aux = self.weight_gate(vis_hat, ir_hat, z_fus)
+        gated = weight_ir_channel * ir_hat + (1.0 - weight_ir_channel) * vis_hat
         fused = self.fuse(gated)
         fused = self.context(fused)
         fused = self.residual(fused) + fused
@@ -166,7 +215,7 @@ class DeepSemanticCrossModalFusionBlock(nn.Module):
             'ir_tilde': ir_tilde,
             'vis_hat': vis_hat,
             'ir_hat': ir_hat,
-            'weight': weight_ir,
+            **gate_aux,
         }
 
 
@@ -198,6 +247,7 @@ class TGCSF(nn.Module):
         self.final_refine = TransformerBlock(channels, _valid_heads(channels, num_heads), ffn_expansion_factor, False, 'WithBias')
         self.out_norm = nn.BatchNorm2d(channels)
         self.res_scale = nn.Parameter(torch.tensor(float(init_res_scale)))
+        self.image_gate_scale_logits = nn.Parameter(torch.tensor([3.0, 0.0, 0.0], dtype=torch.float32))
 
     @staticmethod
     def _as_three_levels(x: TensorOrPyramid) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -243,8 +293,27 @@ class TGCSF(nn.Module):
             'weight_l1': aux_l1['weight'],
             'weight_l2': aux_l2['weight'],
             'weight_l3': aux_l3['weight'],
+            'weight_raw_l1': aux_l1['weight'],
+            'weight_raw_l2': aux_l2['weight'],
+            'weight_raw_l3': aux_l3['weight'],
+            'weight_channel_l1': aux_l1['weight_channel'],
+            'weight_channel_l2': aux_l2['weight_channel'],
+            'weight_channel_l3': aux_l3['weight_channel'],
+            'weight_channel_mean_l1': aux_l1['weight_channel_mean'],
+            'weight_channel_mean_l2': aux_l2['weight_channel_mean'],
+            'weight_channel_mean_l3': aux_l3['weight_channel_mean'],
             'spatial_res_scale': self.res_scale.detach(),
         }
+        raw_weight_l1 = aux_l1['weight']
+        weight_l2_up = F.interpolate(aux_l2['weight'], size=raw_weight_l1.shape[-2:], mode='bilinear', align_corners=False)
+        weight_l3_up = F.interpolate(aux_l3['weight'], size=raw_weight_l1.shape[-2:], mode='bilinear', align_corners=False)
+        scale_weights = torch.softmax(self.image_gate_scale_logits, dim=0)
+        aux['image_gate_scale_weights'] = scale_weights
+        aux['weight_multiscale'] = (
+            scale_weights[0] * raw_weight_l1
+            + scale_weights[1] * weight_l2_up
+            + scale_weights[2] * weight_l3_up
+        )
         if return_pyramid:
             if return_aux:
                 return out, spatial_pyramid, aux
